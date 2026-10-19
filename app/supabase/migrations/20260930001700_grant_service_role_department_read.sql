@@ -1,0 +1,1 @@
+GRANT SELECT ON TABLE public.departments TO service_role;
