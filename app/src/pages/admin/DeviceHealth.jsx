@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "../../lib/supabaseClient";
+import EcgMonitor from "../../components/EcgMonitor";
 
 const INVENTORY_REFRESH_MS = 30_000;
 const HISTORY_REFRESH_MS = 30_000;
@@ -52,46 +53,6 @@ function ReadingChart({ readings, field, title, unit }) {
   return <article className="panel-card device-health-panel"><h3>{title}</h3><p>{min.toFixed(1)}–{max.toFixed(1)} {unit} · {points.length} readings</p><svg viewBox="0 0 600 200" role="img" aria-label={`${title} chart with ${points.length} recorded values`} style={{ width: "100%", height: 200 }}><line x1="20" y1="180" x2="580" y2="180" stroke="currentColor" opacity=".2"/><polyline points={coords} fill="none" stroke="#16845b" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round"/></svg><small>Recorded values; gaps between samples are not interpolated clinically.</small></article>;
 }
 
-function EcgTrendChart({ readings, latest }) {
-  const latestAgeMs = latest?.recorded_at ? Date.now() - new Date(latest.recorded_at).getTime() : Infinity;
-  const latestIsUsable = latest?.sensor_status?.ecg_sensor === "ok" && latest?.ecg_value != null && Number.isFinite(Number(latest.ecg_value)) && latestAgeMs <= 3_000;
-  const cutoff = Date.now() - 60_000;
-  const points = [...readings]
-    .filter((reading) => {
-      const time = new Date(reading.recorded_at).getTime();
-      return reading.ecg_value != null && Number.isFinite(Number(reading.ecg_value)) && Number.isFinite(time) && time >= cutoff;
-    })
-    .reverse();
-
-  return (
-    <article className="panel-card device-health-panel ecg-trend-card">
-      <div className="device-health-section-heading">
-        <div><h3>Heart electrical activity · last minute</h3><p>Saved raw ADC window averages, with their recorded times</p></div>
-        <span className="ecg-live-indicator" role="status"><i aria-hidden="true" />Live · refreshes every second</span>
-        <span className={`ecg-signal-state${latestIsUsable ? " is-usable" : ""}`}>{latestIsUsable ? "Signal present" : "No usable current signal"}</span>
-      </div>
-      <>
-        <svg className="ecg-trend-svg" viewBox="0 0 720 240" role="img" aria-label={latestIsUsable ? `Recorded ECG ADC trend with ${points.length} real samples from the last minute` : "ECG monitor grid; no valid samples because the current signal is unavailable"}>
-          <defs><pattern id="ecg-small-grid" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M 12 0 L 0 0 0 12" fill="none" stroke="#f3caca" strokeWidth="0.6" /></pattern><pattern id="ecg-large-grid" width="60" height="60" patternUnits="userSpaceOnUse"><rect width="60" height="60" fill="url(#ecg-small-grid)"/><path d="M 60 0 L 0 0 0 60" fill="none" stroke="#e7a9a9" strokeWidth="1" /></pattern></defs>
-          <rect width="720" height="240" fill="url(#ecg-large-grid)" />
-          {latestIsUsable && points.length >= 2 ? (() => {
-              const values = points.map((point) => Number(point.ecg_value));
-              const min = Math.min(...values); const max = Math.max(...values); const spread = max - min || 1;
-              const coords = values.map((value, index) => `${24 + index * 672 / (values.length - 1)},${214 - ((value - min) / spread) * 188}`).join(" ");
-              return <polyline points={coords} fill="none" stroke="#087f63" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />;
-            })() : <text x="360" y="125" textAnchor="middle" fill="#a52b2b" fontSize="18" fontWeight="600">{latestIsUsable ? "Waiting for valid saved samples" : "NO VALID ECG SIGNAL · CHECK LEADS"}</text>}
-        </svg>
-        {latestIsUsable && points.length >= 2 ? (
-          <>
-            <div className="ecg-trend-times"><span>{new Date(points[0].recorded_at).toLocaleTimeString()}</span><span>{new Date(points.at(-1).recorded_at).toLocaleTimeString()}</span></div>
-            <small>{points.length} saved points · newest sample {new Date(points.at(-1).recorded_at).toLocaleTimeString()}. The firmware stores one one-second window average per upload; this monitor-style trend is not a clinical ECG waveform or diagnostic display.</small>
-          </>
-        ) : <small>No trace is drawn unless recent, real samples are valid. Current firmware reports lead-off or no valid samples.</small>}
-      </>
-    </article>
-  );
-}
-
 function deviceHealthErrorMessage(error) {
   const message = error?.message || "This device's health data could not be loaded.";
   if (error?.code === "PGRST202" || message.includes("get_device_health_data")) {
@@ -106,6 +67,8 @@ export default function DeviceHealth() {
   const [query, setQuery] = useState("");
   const [health, setHealth] = useState(null);
   const [liveReadings, setLiveReadings] = useState([]);
+  const [ecgBatches, setEcgBatches] = useState([]);
+  const [ecgFeedError, setEcgFeedError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState("");
@@ -216,6 +179,44 @@ export default function DeviceHealth() {
   useEffect(() => {
     if (!selectedId) return undefined;
     let current = true;
+    let inFlight = false;
+    let since = null;
+    const fetchBatches = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const { data, error: batchError } = await supabase.rpc("get_device_ecg_batches", {
+          p_device_id: Number(selectedId),
+          p_seconds: 10,
+          p_since: since,
+        });
+        if (batchError) throw batchError;
+        if (current) setEcgFeedError(false);
+        const incoming = Array.isArray(data?.batches) ? data.batches : [];
+        if (!current || !incoming.length) return;
+        const newest = incoming.reduce((latest, batch) => !latest || new Date(batch.recorded_at) > new Date(latest.recorded_at) ? batch : latest, null);
+        if (newest) since = newest.recorded_at;
+        setEcgBatches((existing) => {
+          const byId = new Map(existing.map((batch) => [batch.batch_id, batch]));
+          incoming.forEach((batch) => byId.set(batch.batch_id, batch));
+          return [...byId.values()].sort((a, b) => new Date(a.recorded_at) - new Date(b.recorded_at)).slice(-12);
+        });
+      } catch {
+        if (current) setEcgFeedError(true);
+        // Failed polling leaves prior batches visible; the monitor marks them
+        // unusable once their server recorded_at timestamp is over three seconds old.
+      } finally {
+        inFlight = false;
+      }
+    };
+    fetchBatches();
+    const timer = window.setInterval(fetchBatches, LIVE_REFRESH_MS);
+    return () => { current = false; window.clearInterval(timer); };
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return undefined;
+    let current = true;
     const loadConfiguration = async () => {
       try {
         const { data, error: configError } = await supabase.rpc("get_device_measurement_config", { p_device_id: Number(selectedId) });
@@ -264,6 +265,8 @@ export default function DeviceHealth() {
     initialLoadStartedForRef.current = null;
     setHealth(null);
     setLiveReadings([]);
+    setEcgBatches([]);
+    setEcgFeedError(false);
     setConfiguration(connectedSensorConfig(DEFAULT_CONFIG));
     setConfigVersion(0);
     setConfigMessage("");
@@ -347,7 +350,7 @@ export default function DeviceHealth() {
 
         {device.has_patient_assignment && <>
           {latest && <section className="panel-card device-health-panel"><h3>Sensor status</h3><ul className="device-health-diagnostics">{visibleSensorEntries(latest.sensor_status).map(([key, status]) => <li key={key}><span>{SENSOR_STATUS_LABELS[key] || key}</span><strong>{status.replaceAll("_", " ")}</strong></li>)}</ul>{visibleSensorEntries(latest.sensor_errors).length > 0 && <div className="clinical-message clinical-error" role="status">{visibleSensorEntries(latest.sensor_errors).map(([key, message]) => <div key={key}>{SENSOR_STATUS_LABELS[key] || key}: {message}</div>)}</div>}</section>}
-          <div className="device-health-details"><ReadingChart readings={readings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate (prototype)" unit="bpm"/><EcgTrendChart readings={liveReadings} latest={latest}/></div>
+          <div className="device-health-details"><ReadingChart readings={readings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate (prototype)" unit="bpm"/><EcgMonitor batches={ecgBatches} feedError={ecgFeedError}/></div>
         </>}
 
         <section className="panel-card device-health-panel">

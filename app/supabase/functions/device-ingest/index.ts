@@ -39,6 +39,10 @@ interface VitalPayload {
   distance_mm?: number | null;
   ecg_lead_off_positive?: boolean | null;
   ecg_lead_off_negative?: boolean | null;
+  ecg_batch_id?: string;
+  ecg_sample_rate_hz?: number;
+  ecg_batch_started_at?: string;
+  ecg_samples?: number[];
   sensor_status?: Record<string, string> | null;
   sensor_errors?: Record<string, string> | null;
 
@@ -345,6 +349,27 @@ Deno.serve(async (req: Request) => {
     }
     if (body.ingestion_id != null && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.ingestion_id)) {
       return jsonResponse({ error: "Invalid ingestion_id" }, 400);
+    }
+
+    const hasEcgBatch = body.ecg_samples !== undefined || body.ecg_batch_id !== undefined ||
+      body.ecg_sample_rate_hz !== undefined || body.ecg_batch_started_at !== undefined;
+    if (hasEcgBatch) {
+      if (!Array.isArray(body.ecg_samples) || body.ecg_samples.length < 200 || body.ecg_samples.length > 300 ||
+        body.ecg_samples.some((sample) => !Number.isInteger(sample) || sample < 0 || sample > 4095) ||
+        body.ecg_sample_rate_hz !== 250 ||
+        typeof body.ecg_batch_id !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.ecg_batch_id) ||
+        (body.ecg_batch_started_at !== undefined &&
+          (typeof body.ecg_batch_started_at !== "string" || !Number.isFinite(Date.parse(body.ecg_batch_started_at))))) {
+        return jsonResponse({ error: "Invalid raw ECG batch" }, 400);
+      }
+      if (body.ecg_lead_off_positive == null || body.ecg_lead_off_negative == null) {
+        return jsonResponse({ error: "Raw ECG batches require lead-off state" }, 400);
+      }
+      if (body.ecg_batch_started_at !== undefined &&
+        Math.abs(Date.now() - Date.parse(body.ecg_batch_started_at)) > 60_000) {
+        return jsonResponse({ error: "ECG batch timestamp is outside the allowed clock-skew window" }, 400);
+      }
     }
 
     // ========================================================
@@ -715,6 +740,26 @@ Deno.serve(async (req: Request) => {
       if (metadataError) {
         logDatabaseFailure("reading_metadata_update", diagnosticId, metadataError.code);
         return jsonResponse({ error: "Failed to record sensor metadata", diagnostic_id: diagnosticId }, 500);
+      }
+    }
+
+    if (hasEcgBatch) {
+      const { error: ecgBatchError } = await supabase.from("device_ecg_batches").upsert({
+        batch_id: body.ecg_batch_id,
+        device_id: deviceId,
+        // Patient identity is resolved from the registered device above; the
+        // device cannot choose a patient in its request body.
+        patient_id: assignedPatientId,
+        batch_started_at: body.ecg_batch_started_at ?? new Date(Date.now() - 1000).toISOString(),
+        sample_rate_hz: body.ecg_sample_rate_hz,
+        samples: body.ecg_samples,
+        lead_off_positive: body.ecg_lead_off_positive,
+        lead_off_negative: body.ecg_lead_off_negative,
+        signal_saturated: body.ecg_samples!.some((sample) => sample === 0 || sample === 4095),
+      }, { onConflict: "device_id,batch_id", ignoreDuplicates: true });
+      if (ecgBatchError) {
+        logDatabaseFailure("ecg_batch_insert", diagnosticId, ecgBatchError.code);
+        return jsonResponse({ error: "Failed to record raw ECG batch", diagnostic_id: diagnosticId }, 500);
       }
     }
 
