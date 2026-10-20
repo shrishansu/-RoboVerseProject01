@@ -35,6 +35,12 @@ export default function MainAdminLayout() {
       path: "/admin/devices",
       icon: "◈",
     },
+
+    {
+      label: "Device Health",
+      path: "/admin/device-health",
+      icon: "H",
+    },
     {
       label: "Alerts",
       path: "/admin/alerts",

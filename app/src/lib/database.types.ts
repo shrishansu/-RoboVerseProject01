@@ -1399,19 +1399,32 @@ export type Database = {
       vital_readings: {
         Row: {
           blood_glucose: number | null
+          configuration_version: number | null
           created_at: string
+          distance_mm: number | null
           device_id: number | null
           diastolic_bp: number | null
           ecg_value: number | null
+          ecg_lead_off_negative: boolean | null
+          ecg_lead_off_positive: boolean | null
           heart_rate: number | null
           id: number
+          ingestion_id: string | null
+          ir_raw: number | null
           motion_x: number | null
           motion_y: number | null
           motion_z: number | null
+          object_temperature_c: number | null
           patient_id: number
+          pulse_rate_estimate_bpm: number | null
+          red_raw: number | null
           recorded_at: string
           recorded_by: string | null
           respiratory_rate: number | null
+          sensor_errors: Json | null
+          sensor_status: Json | null
+          signal_quality: number | null
+          signal_valid: boolean | null
           source: string
           spo2: number | null
           systolic_bp: number | null
@@ -1420,19 +1433,32 @@ export type Database = {
         }
         Insert: {
           blood_glucose?: number | null
+          configuration_version?: number | null
           created_at?: string
+          distance_mm?: number | null
           device_id?: number | null
           diastolic_bp?: number | null
           ecg_value?: number | null
+          ecg_lead_off_negative?: boolean | null
+          ecg_lead_off_positive?: boolean | null
           heart_rate?: number | null
           id?: number
+          ingestion_id?: string | null
+          ir_raw?: number | null
           motion_x?: number | null
           motion_y?: number | null
           motion_z?: number | null
+          object_temperature_c?: number | null
           patient_id: number
+          pulse_rate_estimate_bpm?: number | null
+          red_raw?: number | null
           recorded_at?: string
           recorded_by?: string | null
           respiratory_rate?: number | null
+          sensor_errors?: Json | null
+          sensor_status?: Json | null
+          signal_quality?: number | null
+          signal_valid?: boolean | null
           source?: string
           spo2?: number | null
           systolic_bp?: number | null
@@ -1441,19 +1467,32 @@ export type Database = {
         }
         Update: {
           blood_glucose?: number | null
+          configuration_version?: number | null
           created_at?: string
+          distance_mm?: number | null
           device_id?: number | null
           diastolic_bp?: number | null
           ecg_value?: number | null
+          ecg_lead_off_negative?: boolean | null
+          ecg_lead_off_positive?: boolean | null
           heart_rate?: number | null
           id?: number
+          ingestion_id?: string | null
+          ir_raw?: number | null
           motion_x?: number | null
           motion_y?: number | null
           motion_z?: number | null
+          object_temperature_c?: number | null
           patient_id?: number
+          pulse_rate_estimate_bpm?: number | null
+          red_raw?: number | null
           recorded_at?: string
           recorded_by?: string | null
           respiratory_rate?: number | null
+          sensor_errors?: Json | null
+          sensor_status?: Json | null
+          signal_quality?: number | null
+          signal_valid?: boolean | null
           source?: string
           spo2?: number | null
           systolic_bp?: number | null
@@ -1598,6 +1637,10 @@ export type Database = {
       get_current_user_hospital_id: { Args: never; Returns: number }
       get_current_user_role: { Args: never; Returns: string }
       get_device_management_data: { Args: never; Returns: Json }
+        get_device_health_data: { Args: { p_device_id: number; p_from?: string | null; p_to?: string | null }; Returns: Json }
+        get_device_measurement_config: { Args: { p_device_id: number }; Returns: Json }
+        save_device_measurement_config: { Args: { p_device_id: number; p_config: Json }; Returns: Json }
+      get_my_assigned_device_health: { Args: never; Returns: Json }
       get_main_admin_dashboard_stats: { Args: never; Returns: Json }
       get_main_admin_hospital_directory: { Args: never; Returns: Json }
       get_main_admin_staff_directory: {

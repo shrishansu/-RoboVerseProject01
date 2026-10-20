@@ -261,6 +261,11 @@ export default function AdminDashboard() {
               Manage Doctors
             </Link>
 
+            <Link to="/admin/device-health">
+              <span>♥</span>
+              Review Device Health
+            </Link>
+
             <Link to="/admin/audit-logs">
               <span>≡</span>
               View Audit Logs

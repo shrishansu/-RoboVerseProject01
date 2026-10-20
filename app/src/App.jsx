@@ -10,6 +10,7 @@ const Hospitals = lazy(() => import("./pages/admin/Hospitals"));
 const Doctors = lazy(() => import("./pages/admin/Doctors"));
 const Nurses = lazy(() => import("./pages/admin/Nurses"));
 const Devices = lazy(() => import("./pages/admin/Devices"));
+const DeviceHealth = lazy(() => import("./pages/admin/DeviceHealth"));
 const Alerts = lazy(() => import("./pages/admin/Alerts"));
 const AuditLogs = lazy(() => import("./pages/admin/AuditLogs"));
 const Security = lazy(() => import("./pages/admin/Security"));
@@ -128,6 +129,8 @@ function App() {
           path="devices"
           element={<Devices />}
         />
+
+        <Route path="device-health" element={<DeviceHealth />} />
 
         <Route
           path="alerts"

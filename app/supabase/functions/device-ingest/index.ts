@@ -34,10 +34,23 @@ interface VitalPayload {
   weight_kg?: number | null;
 
   ecg_value?: number | null;
+  object_temperature_c?: number | null;
+  pulse_rate_estimate_bpm?: number | null;
+  distance_mm?: number | null;
+  ecg_lead_off_positive?: boolean | null;
+  ecg_lead_off_negative?: boolean | null;
+  sensor_status?: Record<string, string> | null;
+  sensor_errors?: Record<string, string> | null;
 
   motion_x?: number | null;
   motion_y?: number | null;
   motion_z?: number | null;
+  red_raw?: number | null;
+  ir_raw?: number | null;
+  signal_quality?: number | null;
+  signal_valid?: boolean | null;
+  configuration_version?: number | null;
+  ingestion_id?: string | null;
 }
 
 function jsonResponse(
@@ -67,6 +80,18 @@ function isValidNumber(value: unknown): boolean {
   );
 }
 
+function logDatabaseFailure(stage: string, diagnosticId: string, code?: string) {
+  // Never log request headers, device secrets, password hashes, patient IDs,
+  // or raw database error objects. The diagnostic ID joins this event to the
+  // generic 500 response returned to the device.
+  console.error(JSON.stringify({
+    event: "device_ingest_database_failure",
+    diagnostic_id: diagnosticId,
+    stage,
+    database_code: code || "unknown",
+  }));
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", {
@@ -82,6 +107,8 @@ Deno.serve(async (req: Request) => {
       405,
     );
   }
+
+  const diagnosticId = crypto.randomUUID();
 
   try {
     // ========================================================
@@ -149,21 +176,24 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (credentialError) {
-      console.error(
-        "Credential lookup failed:",
-        credentialError,
-      );
+      logDatabaseFailure("credential_lookup", diagnosticId, credentialError.code);
 
       return jsonResponse(
         {
           error:
             "Authentication service error",
+          diagnostic_id: diagnosticId,
         },
         500,
       );
     }
 
     if (!credential) {
+      console.warn(JSON.stringify({
+        event: "device_credential_rejected",
+        diagnostic_id: diagnosticId,
+        reason: "missing_or_inactive_credential",
+      }));
       return jsonResponse(
         {
           error:
@@ -189,21 +219,24 @@ Deno.serve(async (req: Request) => {
     );
 
     if (verifyError) {
-      console.error(
-        "Secret verification failed:",
-        verifyError,
-      );
+      logDatabaseFailure("secret_verification", diagnosticId, verifyError.code);
 
       return jsonResponse(
         {
           error:
             "Authentication service error",
+          diagnostic_id: diagnosticId,
         },
         500,
       );
     }
 
     if (!secretMatch) {
+      console.warn(JSON.stringify({
+        event: "device_credential_rejected",
+        diagnostic_id: diagnosticId,
+        reason: "secret_mismatch",
+      }));
       return jsonResponse(
         {
           error:
@@ -269,9 +302,16 @@ Deno.serve(async (req: Request) => {
       "blood_glucose",
       "weight_kg",
       "ecg_value",
+      "object_temperature_c",
+      "pulse_rate_estimate_bpm",
+      "distance_mm",
       "motion_x",
       "motion_y",
       "motion_z",
+      "red_raw",
+      "ir_raw",
+      "signal_quality",
+      "configuration_version",
     ] as const;
 
     for (const field of numericFields) {
@@ -283,6 +323,28 @@ Deno.serve(async (req: Request) => {
           400,
         );
       }
+    }
+
+    if (body.signal_valid != null && typeof body.signal_valid !== "boolean") {
+      return jsonResponse({ error: "Invalid signal_valid" }, 400);
+    }
+    for (const field of ["ecg_lead_off_positive", "ecg_lead_off_negative"] as const) {
+      if (body[field] != null && typeof body[field] !== "boolean") {
+        return jsonResponse({ error: `Invalid ${field}` }, 400);
+      }
+    }
+    const allowedSensorKeys = new Set([
+      "heart_reader", "temperature_sensor", "movement_sensor", "distance_sensor", "ecg_sensor",
+    ]);
+    for (const [field, map] of [["sensor_status", body.sensor_status], ["sensor_errors", body.sensor_errors]] as const) {
+      if (map == null) continue;
+      if (typeof map !== "object" || Array.isArray(map) ||
+        Object.entries(map).some(([key, value]) => !allowedSensorKeys.has(key) || typeof value !== "string" || value.length > 120)) {
+        return jsonResponse({ error: `Invalid ${field}` }, 400);
+      }
+    }
+    if (body.ingestion_id != null && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.ingestion_id)) {
+      return jsonResponse({ error: "Invalid ingestion_id" }, 400);
     }
 
     // ========================================================
@@ -335,6 +397,22 @@ Deno.serve(async (req: Request) => {
         },
         400,
       );
+    }
+
+    if (body.object_temperature_c != null &&
+      (body.object_temperature_c < -70 || body.object_temperature_c > 380)) {
+      return jsonResponse({ error: "Invalid infrared object temperature range" }, 400);
+    }
+    if (body.pulse_rate_estimate_bpm != null &&
+      (body.pulse_rate_estimate_bpm < 30 || body.pulse_rate_estimate_bpm > 200)) {
+      return jsonResponse({ error: "Invalid pulse rate estimate" }, 400);
+    }
+    if (body.distance_mm != null &&
+      (!Number.isInteger(body.distance_mm) || body.distance_mm < 0 || body.distance_mm > 8190)) {
+      return jsonResponse({ error: "Invalid distance_mm" }, 400);
+    }
+    if (body.ecg_value != null && (body.ecg_value < 0 || body.ecg_value > 4095)) {
+      return jsonResponse({ error: "Invalid raw ECG ADC value" }, 400);
     }
 
     if (
@@ -436,15 +514,12 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (deviceError) {
-      console.error(
-        "Device lookup failed:",
-        deviceError,
-      );
+      logDatabaseFailure("device_lookup", diagnosticId, deviceError.code);
 
       return jsonResponse(
         {
-          error:
-            "Device lookup failed",
+          error: "Device lookup failed",
+          diagnostic_id: diagnosticId,
         },
         500,
       );
@@ -505,10 +580,7 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
 
     if (patientError) {
-      console.error(
-        "Patient lookup failed:",
-        patientError,
-      );
+      logDatabaseFailure("patient_lookup", diagnosticId, patientError.code);
 
       return jsonResponse(
         {
@@ -602,18 +674,64 @@ Deno.serve(async (req: Request) => {
     );
 
     if (readingError) {
-      console.error(
-        "Vital reading failed:",
-        readingError,
-      );
+      logDatabaseFailure("record_vital_reading", diagnosticId, readingError.code);
 
       return jsonResponse(
         {
-          error:
-            "Failed to record vital reading",
+          error: "Failed to record vital reading",
+          diagnostic_id: diagnosticId,
         },
         500,
       );
+    }
+
+    // These optional fields are written only when firmware actually supplies
+    // them; the existing vital-reading RPC remains the source of clinical rows.
+    if (body.red_raw != null || body.ir_raw != null || body.signal_quality != null ||
+        body.signal_valid != null || body.configuration_version != null || body.ingestion_id != null ||
+        body.object_temperature_c !== undefined || body.pulse_rate_estimate_bpm !== undefined ||
+        body.distance_mm !== undefined || body.ecg_lead_off_positive !== undefined ||
+        body.ecg_lead_off_negative !== undefined || body.sensor_status !== undefined ||
+        body.sensor_errors !== undefined) {
+      const metadataUpdate: Record<string, unknown> = {
+        red_raw: body.red_raw ?? null,
+        ir_raw: body.ir_raw ?? null,
+        signal_quality: body.signal_quality ?? null,
+        signal_valid: body.signal_valid ?? null,
+        configuration_version: body.configuration_version ?? null,
+        ingestion_id: body.ingestion_id ?? null,
+      };
+      // Keep legacy device payloads operational until the additive telemetry
+      // migration is applied; new fields are written when the firmware sends them.
+      if (body.object_temperature_c !== undefined) metadataUpdate.object_temperature_c = body.object_temperature_c;
+      if (body.pulse_rate_estimate_bpm !== undefined) metadataUpdate.pulse_rate_estimate_bpm = body.pulse_rate_estimate_bpm;
+      if (body.distance_mm !== undefined) metadataUpdate.distance_mm = body.distance_mm;
+      if (body.ecg_lead_off_positive !== undefined) metadataUpdate.ecg_lead_off_positive = body.ecg_lead_off_positive;
+      if (body.ecg_lead_off_negative !== undefined) metadataUpdate.ecg_lead_off_negative = body.ecg_lead_off_negative;
+      if (body.sensor_status !== undefined) metadataUpdate.sensor_status = body.sensor_status;
+      if (body.sensor_errors !== undefined) metadataUpdate.sensor_errors = body.sensor_errors;
+      const { error: metadataError } = await supabase.from("vital_readings").update(metadataUpdate)
+        .eq("id", readingId).eq("device_id", deviceId);
+      if (metadataError) {
+        logDatabaseFailure("reading_metadata_update", diagnosticId, metadataError.code);
+        return jsonResponse({ error: "Failed to record sensor metadata", diagnostic_id: diagnosticId }, 500);
+      }
+    }
+
+    // Record server-side communication time only after the reading was stored.
+    const ingestionTimestamp = new Date().toISOString();
+    const { data: deviceActivity, error: deviceActivityError } = await supabase
+      .from("devices")
+      .update({ last_seen_at: ingestionTimestamp, status: "online" })
+      .eq("id", deviceId)
+      .in("status", ["offline", "online"])
+      .select("id")
+      .maybeSingle();
+
+    if (deviceActivityError) {
+      // The reading is already stored; keep the successful ingest response while
+      // reporting that the independent activity timestamp could not be updated.
+      logDatabaseFailure("device_activity_update", diagnosticId, deviceActivityError.code);
     }
 
     // ========================================================
@@ -650,22 +768,29 @@ Deno.serve(async (req: Request) => {
       patient_id:
         assignedPatientId,
 
+      last_seen_at_updated:
+        Boolean(deviceActivity) && !deviceActivityError,
+
+      ingested_at:
+        ingestionTimestamp,
+
       recorded_at:
         body.recorded_at ??
         new Date().toISOString(),
     });
 
   } catch (error) {
-
-    console.error(
-      "Unexpected error:",
-      error,
-    );
+    console.error(JSON.stringify({
+      event: "device_ingest_unexpected_failure",
+      diagnostic_id: diagnosticId,
+      error_type: error instanceof Error ? error.name : "unknown",
+    }));
 
     return jsonResponse(
       {
         error:
           "Internal server error",
+          diagnostic_id: diagnosticId,
       },
       500,
     );

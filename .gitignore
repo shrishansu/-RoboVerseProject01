@@ -1,1 +1,5 @@
 /.vscode
+
+# Local ESP32 Wi-Fi and per-device credentials
+firmware/**/secrets.h
+firmware/**/secrets.ino

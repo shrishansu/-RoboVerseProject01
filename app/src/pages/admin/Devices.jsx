@@ -34,7 +34,8 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
   const [assigningId, setAssigningId] = useState(null);
   const [assignmentPatients, setAssignmentPatients] = useState([]);
   const [loadingAssignmentPatients, setLoadingAssignmentPatients] = useState(false);
-  const [provisionedSecret, setProvisionedSecret] = useState("");
+  const [provisionedCredential, setProvisionedCredential] = useState(null);
+  const [provisioningId, setProvisioningId] = useState(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -165,20 +166,49 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
   };
 
   const provisionCredential = async (device) => {
+    const confirmed = window.confirm(
+      `Provision a new credential for ${device.device_name} (database ID ${device.id})? The secret will be shown once. If an active credential exists, it must be explicitly revoked first.`,
+    );
+    if (!confirmed) return;
     setError("");
     setNotice("");
-    setProvisionedSecret("");
+    setProvisionedCredential(null);
+    setProvisioningId(device.id);
     try {
       const { data: result, error: rpcError } = await supabase.rpc("provision_device_credential", {
         target_device_id: device.id,
       });
       if (rpcError) throw rpcError;
-      if (!result?.device_secret) throw new Error("Credential secret was not returned");
-      setProvisionedSecret(result.device_secret);
-      setNotice(`Credential provisioned for ${device.device_code}. Copy it now; it cannot be retrieved later.`);
+      if (!result?.device_secret || Number(result.device_id) !== Number(device.id) || result.credential_id == null) {
+        throw new Error("Provisioning response was incomplete. Refresh the device list and check the credential status.");
+      }
+      setProvisionedCredential({
+        deviceId: result.device_id,
+        credentialId: result.credential_id,
+        secret: result.device_secret,
+        warning: result.warning || "Store this secret securely. It cannot be retrieved again.",
+      });
+      setNotice(`Credential ${result.credential_id} provisioned for device ID ${device.id}.`);
       await loadData();
     } catch (err) {
-      setError(deviceErrorMessage(err, "Credential could not be provisioned. Revoke any active credential first and confirm the device is eligible."));
+      const message = [err?.message, err?.details].filter(Boolean).join(" ").toLowerCase();
+      if (err?.status === 401 || err?.code === "PGRST301" || message.includes("jwt") || message.includes("session")) {
+        setError("Your administrator session may have expired. Sign in again, then retry provisioning.");
+      } else if (message.includes("already has an active credential")) {
+        setError("This device already has an active credential. Use Revoke first, then explicitly provision a replacement.");
+      } else if (message.includes("administrator profile") || message.includes("permission") || message.includes("not authorized")) {
+        setError("Your account does not have permission to provision this device credential.");
+      } else if (message.includes("not found") || message.includes("permitted scope")) {
+        setError("This device is no longer available in your permitted scope. Refresh the device list.");
+      } else if (message.includes("maintenance") || message.includes("inactive")) {
+        setError("A device in maintenance or inactive status cannot receive a credential.");
+      } else if (message.includes("failed to fetch") || message.includes("network")) {
+        setError("The provisioning request could not reach Supabase. Check your connection and retry.");
+      } else {
+        setError(deviceErrorMessage(err, "Credential could not be provisioned. Check the device status and your administrator access."));
+      }
+    } finally {
+      setProvisioningId(null);
     }
   };
 
@@ -186,7 +216,7 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
     if (!window.confirm(`Revoke the credential for ${device.device_code}? Device data ingest will stop until another credential is provisioned.`)) return;
     setError("");
     setNotice("");
-    setProvisionedSecret("");
+    setProvisionedCredential(null);
     try {
       const { error: rpcError } = await supabase.rpc("revoke_device_credential", {
         target_device_id: device.id,
@@ -201,7 +231,7 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
 
   const copyProvisionedSecret = async () => {
     try {
-      await navigator.clipboard.writeText(provisionedSecret);
+      await navigator.clipboard.writeText(provisionedCredential.secret);
       setNotice("Credential copied. Store it in your approved secret manager.");
     } catch {
       setError("Clipboard access was denied. Select and copy the credential manually.");
@@ -229,15 +259,16 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
 
       {error && !showCreateForm && assigningId === null && <div className="clinical-message clinical-error" role="alert">{error}</div>}
       {notice && <div className="clinical-message clinical-success" role="status">{notice}</div>}
-      {provisionedSecret && <div className="hospital-facility-form" role="region" aria-label="One-time device credential">
-        <h3>Copy this device credential now</h3>
-        <p>This secret is shown only in this provisioning response. Store it securely and configure the device before closing this page.</p>
+      {provisionedCredential && <div className="device-secret-backdrop"><section className="hospital-facility-form device-secret-dialog" role="dialog" aria-modal="true" aria-labelledby="device-secret-heading">
+        <h3 id="device-secret-heading">One-time device credential</h3>
+        <p>Device ID <strong>{provisionedCredential.deviceId}</strong> · Credential ID <strong>{provisionedCredential.credentialId}</strong></p>
+        <p className="device-secret-warning">{provisionedCredential.warning} Copy and store it securely now. Closing this dialog permanently clears the secret from this page.</p>
         <div className="hospital-facility-actions">
-          <code className="device-secret-value">{provisionedSecret}</code>
+          <code className="device-secret-value">{provisionedCredential.secret}</code>
           <button type="button" className="secondary-action" onClick={copyProvisionedSecret}>Copy credential</button>
-          <button type="button" className="secondary-action" onClick={() => setProvisionedSecret("")}>Hide credential</button>
+          <button type="button" className="secondary-action" onClick={() => setProvisionedCredential(null)}>Close and clear secret</button>
         </div>
-      </div>}
+      </section></div>}
 
       {showCreateForm && (
         <form className="hospital-facility-form" onSubmit={createDevice}>
@@ -323,8 +354,8 @@ export default function Devices({ hospitalId = null, hospitalName = "" }) {
               <td>{device.credential_status === "active" ? (
                 <button type="button" className="secondary-action" onClick={() => revokeCredential(device)}>Revoke</button>
               ) : (
-                <button type="button" className="secondary-action" onClick={() => provisionCredential(device)} disabled={device.status === "inactive" || device.status === "maintenance"}>
-                  {device.credential_status === "revoked" ? "Rotate credential" : "Provision credential"}
+                <button type="button" className="secondary-action" onClick={() => provisionCredential(device)} disabled={device.status === "inactive" || device.status === "maintenance" || provisioningId === device.id}>
+                  {provisioningId === device.id ? "Provisioning..." : device.credential_status === "revoked" ? "Provision replacement" : "Provision credential"}
                 </button>
               )}</td>
               <td><label className="visually-hidden" htmlFor={`device-status-${device.id}`}>Status for {device.device_code}</label>

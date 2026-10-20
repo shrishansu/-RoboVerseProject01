@@ -47,6 +47,18 @@ function formatValue(value, unit = "") {
   return unit ? `${value} ${unit}` : String(value);
 }
 
+const SENSOR_LABELS = {
+  heart_reader: "Heart and blood oxygen reader",
+  distance_sensor: "Distance sensor",
+  movement_sensor: "Movement sensor",
+  ecg_sensor: "Heart electrical activity sensor",
+};
+
+function formatSensorStatus(value) {
+  if (!value) return "Unavailable";
+  return String(value).replaceAll("_", " ");
+}
+
 function getPatientName(patient) {
   return [patient.first_name, patient.middle_name, patient.last_name]
     .filter(Boolean)
@@ -124,18 +136,37 @@ export default function ClinicalDashboard({ role }) {
     setError("");
 
     try {
-      const { data, error: queryError } = await supabase.rpc(
-        "get_my_clinical_dashboard",
-        { p_limit: 200 },
-      );
+      const [{ data, error: queryError }, { data: deviceHealth, error: deviceError }] = await Promise.all([
+        supabase.rpc("get_my_clinical_dashboard", { p_limit: 200 }),
+        supabase.rpc("get_my_assigned_device_health"),
+      ]);
 
       if (queryError) throw queryError;
+      if (deviceError) throw deviceError;
 
       if (data?.staff_profile_missing) {
         setPatients([]);
         setError("Your active clinical staff profile is not linked to this account. Ask your hospital administrator to check the account setup.");
       } else if (Array.isArray(data?.patients)) {
-        setPatients(data.patients);
+        const devicesByPatient = new Map();
+        (Array.isArray(deviceHealth) ? deviceHealth : []).forEach((item) => {
+          const rows = devicesByPatient.get(item.patient_id) || [];
+          rows.push(item);
+          devicesByPatient.set(item.patient_id, rows);
+        });
+        setPatients(data.patients.map((patient) => {
+          const assignedDevices = devicesByPatient.get(patient.id) || [];
+          const latestDeviceReading = assignedDevices
+            .map((item) => item.latest_reading)
+            .filter((reading) => reading?.recorded_at)
+            .sort((left, right) => new Date(right.recorded_at) - new Date(left.recorded_at))[0] || null;
+          const previousReading = patient.latest_reading?.source === "iot" ? null : patient.latest_reading;
+          return {
+            ...patient,
+            assigned_devices: assignedDevices,
+            latest_reading: assignedDevices.length ? latestDeviceReading : previousReading,
+          };
+        }));
       } else {
         throw new Error("The clinical dashboard response was invalid.");
       }
@@ -373,6 +404,17 @@ export default function ClinicalDashboard({ role }) {
                     </div>
                   </div>
 
+                  <div className="clinical-assigned-device" aria-label="Assigned monitoring device">
+                    <strong>Monitoring device</strong>
+                    {patient.assigned_devices?.length ? patient.assigned_devices.map((assignedDevice) => (
+                      <span key={assignedDevice.device_id}>
+                        ID {assignedDevice.device_id} · {assignedDevice.device_name || assignedDevice.device_code}
+                        <em className={`device-health-badge ${assignedDevice.status}`}>{assignedDevice.status}</em>
+                        <small>Last successful ingestion: {formatTimestamp(assignedDevice.last_seen_at)}</small>
+                      </span>
+                    )) : <span>No device assigned to this patient.</span>}
+                  </div>
+
                   <div className="clinical-vitals-heading">
                     <h3>Latest readings</h3>
                     <div className="clinical-reading-meta">
@@ -381,13 +423,34 @@ export default function ClinicalDashboard({ role }) {
                     </div>
                   </div>
                   <dl className="clinical-vitals-grid">
-                    <div><dt>Heart rate</dt><dd>{formatValue(reading?.heart_rate, "bpm")}</dd></div>
-                    <div><dt>SpO2</dt><dd>{formatValue(reading?.spo2, "%")}</dd></div>
-                    <div><dt>Temperature</dt><dd>{formatValue(reading?.temperature, "deg C")}</dd></div>
-                    <div><dt>Respiratory rate</dt><dd>{formatValue(reading?.respiratory_rate, "/min")}</dd></div>
-                    <div><dt>Blood pressure</dt><dd>{reading?.systolic_bp == null && reading?.diastolic_bp == null ? "Unavailable" : `${reading.systolic_bp ?? "-"}/${reading.diastolic_bp ?? "-"} mmHg`}</dd></div>
-                    <div><dt>ECG sample</dt><dd>{formatValue(reading?.ecg_value)}</dd></div>
+                    <div><dt>Pulse-rate estimate (prototype)</dt><dd>{formatValue(reading?.pulse_rate_estimate_bpm, "bpm")}</dd></div>
+                    <div><dt>Distance</dt><dd>{formatValue(reading?.distance_mm, "mm")}</dd></div>
+                    <div><dt>ECG raw ADC sample</dt><dd>{reading?.sensor_status?.ecg_sensor === "ok" ? formatValue(reading?.ecg_value) : "Unavailable · check leads"}</dd></div>
+                    <div><dt>Movement X / Y / Z</dt><dd>{[reading?.motion_x, reading?.motion_y, reading?.motion_z].map((value) => formatValue(value, "g")).join(" / ")}</dd></div>
+                    <div><dt>Raw optical RED</dt><dd>{formatValue(reading?.red_raw)}</dd></div>
+                    <div><dt>Raw optical IR</dt><dd>{formatValue(reading?.ir_raw)}</dd></div>
                   </dl>
+
+                  {reading?.source === "iot" && (
+                    <section className="clinical-sensor-summary" aria-label="Device sensor status">
+                      <h3>Device sensor status</h3>
+                      {reading.sensor_status && typeof reading.sensor_status === "object" ? (
+                        <ul>
+                          {Object.entries(SENSOR_LABELS).map(([key, label]) => (
+                            <li key={key}><span>{label}</span><strong>{formatSensorStatus(reading.sensor_status[key])}</strong></li>
+                          ))}
+                        </ul>
+                      ) : <p>Sensor status was not included in this reading.</p>}
+                      {reading.sensor_errors && typeof reading.sensor_errors === "object" && Object.entries(reading.sensor_errors).some(([key]) => Object.hasOwn(SENSOR_LABELS, key)) && (
+                        <ul className="clinical-sensor-errors">
+                          {Object.entries(reading.sensor_errors).filter(([key]) => Object.hasOwn(SENSOR_LABELS, key)).map(([key, message]) => (
+                            <li key={key}>{SENSOR_LABELS[key] || key.replaceAll("_", " ")}: {String(message)}</li>
+                          ))}
+                        </ul>
+                      )}
+                      <small>Raw optical samples and prototype pulse estimates are informational device data, not confirmed clinical measurements. This firmware does not provide SpO₂.</small>
+                    </section>
+                  )}
 
                   <div className="clinical-alert-list">
                     <h3>Active alerts <span>{patientAlerts.length}</span></h3>

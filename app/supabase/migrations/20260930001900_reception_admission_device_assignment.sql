@@ -40,9 +40,12 @@ $function$;
 REVOKE ALL ON FUNCTION public.list_receptionist_available_devices() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.list_receptionist_available_devices() TO authenticated;
 
-DROP FUNCTION public.admit_receptionist_patient(bigint, bigint, text);
+-- Some deployed databases no longer have the legacy three-argument overload.
+-- The migration replaces it when present and can also create the new signature
+-- on databases where that older overload was already removed.
+DROP FUNCTION IF EXISTS public.admit_receptionist_patient(bigint, bigint, text);
 
-CREATE FUNCTION public.admit_receptionist_patient(
+CREATE OR REPLACE FUNCTION public.admit_receptionist_patient(
     p_patient_id bigint,
     p_bed_id bigint,
     p_admission_type text DEFAULT 'routine',
