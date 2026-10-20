@@ -18,7 +18,15 @@ const supabase = createClient(
 );
 
 interface VitalPayload {
+  mode?: string;
   device_id: number;
+
+  packet_sequence?: number;
+  captured_at?: string;
+  sample_rate_hz?: number;
+  samples?: number[];
+  lead_off_positive?: boolean;
+  lead_off_negative?: boolean;
 
   recorded_at?: string;
 
@@ -216,6 +224,58 @@ Deno.serve(async (req: Request) => {
         },
         403,
       );
+    }
+
+    // Fast path: validate and broadcast a small raw ECG packet without
+    // inserting it into vital_readings or device_ecg_batches. The database
+    // RPC checks the same active device credential and assignment, then
+    // publishes only to this device's existing private admin channel.
+    if (body.mode === "ecg_stream") {
+      if (!Number.isSafeInteger(body.packet_sequence) || Number(body.packet_sequence) < 0 ||
+        !Array.isArray(body.samples) || body.samples.length < 10 || body.samples.length > 20 ||
+        body.samples.some((sample) => !Number.isInteger(sample) || sample < 0 || sample > 4095) ||
+        body.sample_rate_hz !== 250 || typeof body.captured_at !== "string" ||
+        !Number.isFinite(Date.parse(body.captured_at)) ||
+        Math.abs(Date.now() - Date.parse(body.captured_at)) > 30_000 ||
+        typeof body.lead_off_positive !== "boolean" || typeof body.lead_off_negative !== "boolean") {
+        return jsonResponse({ error: "Invalid live ECG packet" }, 400);
+      }
+
+      const packet = {
+        device_id: deviceId,
+        packet_sequence: body.packet_sequence,
+        captured_at: body.captured_at,
+        sample_rate_hz: body.sample_rate_hz,
+        samples: body.samples,
+        lead_off_positive: body.lead_off_positive,
+        lead_off_negative: body.lead_off_negative,
+      };
+      const { data: streamResult, error: streamError } = await supabase.rpc(
+        "broadcast_device_ecg_packet",
+        { p_device_id: deviceId, p_device_secret: deviceSecret, p_packet: packet },
+      );
+      if (streamError) {
+        logDatabaseFailure("ecg_stream_broadcast", diagnosticId, streamError);
+        return jsonResponse({ error: "Live ECG stream is unavailable", diagnostic_id: diagnosticId }, 500);
+      }
+      if (streamResult?.error) {
+        const status = Number(streamResult.status) || 500;
+        const messages: Record<string, string> = {
+          invalid_request: "Invalid device request",
+          device_id_mismatch: "Device ID mismatch",
+          invalid_packet: "Invalid ECG packet",
+          invalid_samples: "Invalid ECG samples",
+          invalid_timestamp: "Invalid ECG timestamp",
+          timestamp_outside_window: "ECG packet timestamp is outside the allowed clock-skew window",
+          invalid_device_credentials: "Invalid device credentials",
+          device_not_found: "Device not found",
+          device_not_active: "Device is not active",
+          device_unassigned: "Device has no active patient assignment",
+          device_patient_hospital_mismatch: "Device and patient belong to different hospitals",
+        };
+        return jsonResponse({ error: messages[streamResult.error] || "Live ECG packet was rejected" }, status);
+      }
+      return jsonResponse({ success: true, mode: "ecg_stream", packet_sequence: body.packet_sequence });
     }
 
     // ========================================================

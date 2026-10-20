@@ -3764,4 +3764,6 @@ textarea {
 .device-secret-backdrop{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;padding:20px;background:rgba(8,25,19,.66)}.device-secret-dialog{width:min(720px,100%);max-height:min(90vh,800px);overflow:auto;box-shadow:0 24px 80px rgba(0,0,0,.28)}.device-secret-warning{padding:13px 15px;border:1px solid #e9c96e;border-radius:8px;background:#fff9e7;color:#654d11;line-height:1.5}.device-secret-value{display:block;max-width:100%;overflow-wrap:anywhere;user-select:all;padding:14px;border-radius:8px;background:#f1f4f2;color:#14241c;font-size:.95rem}
 @media(max-width:1000px){.device-health-config-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.device-health-module-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:640px){.device-health-config-grid,.device-health-module-grid{grid-template-columns:1fr}.device-health-module-config{padding:14px}}
-.device-health-page .ecg-canvas-wrap{height:340px;border-color:#d98c94;background:#fffdfd}
+.device-health-page .ecg-canvas-wrap{height:440px;border-color:#245b49;background:#07110f;box-shadow:inset 0 0 22px rgba(0,0,0,.32)}
+.device-health-page .ecg-invalid-overlay{background:rgba(7,17,15,.84);color:#ff8c94}
+@media(max-width:640px){.device-health-page .ecg-canvas-wrap{height:300px}}

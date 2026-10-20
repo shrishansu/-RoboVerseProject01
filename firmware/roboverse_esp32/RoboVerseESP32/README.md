@@ -38,10 +38,37 @@ inputs with no person attached or with a properly isolated setup.
 
 ## Readings and limitations
 
+- Raw ECG is sampled at 250 Hz. A separate FreeRTOS sender sends packets of up
+  to 20 ADC samples (about 80 ms) to `device-ingest`; this is broadcast on the
+  authenticated, private per-device Supabase Realtime channel and is not
+  written to Postgres. The slow summary upload continues every 5 seconds and
+  stores only the newest complete one-second ECG batch with its sensor summary.
+- The frontend joins packets by their capture timestamps and draws the received
+  raw ADC values with about 200 ms playback delay. This is a best-effort live
+  transport target; Wi-Fi, TLS, Edge Function, and Realtime latency vary and
+  must be measured on the deployed project.
+
 - MAX30102 RED/IR values are raw optical samples. The simple pulse interval detector reports a separate experimental pulse-rate estimate only after it sees recent plausible intervals. It is not clinically validated. This sketch does not calculate or upload SpO2.
 - MPU6050 acceleration is converted to g for the existing movement fields.
 - VL53L0X sends distance in millimetres when a range is available.
 - AD8232 sends an unfiltered raw ADC sample (0–4095) and LO+/LO− lead-off flags. It is not a diagnostic ECG.
 - Missing hardware yields null measurements and a sensor status/error entry. Missing readings are not replaced with made-up values.
 
-The request uses `apikey`, `x-device-id`, and `x-device-secret` headers. Its JSON `device_id` is the same numeric ID as the header. The secret is never printed by the sketch or saved by the frontend.
+Both upload paths use `apikey`, `x-device-id`, and `x-device-secret` headers.
+The JSON `device_id` is the same numeric ID as the header. The secret is never
+printed by the sketch or saved by the frontend.
+
+## Live ECG transport deployment
+
+1. Apply `app/supabase/migrations/20261021000100_device_ecg_live_broadcast.sql`
+   to create the service-only packet broadcaster. This is additive and does not
+   add per-packet database rows.
+2. Deploy the updated `device-ingest` function from the `app` directory:
+   `supabase functions deploy device-ingest --project-ref <your-project-ref>`.
+3. Rebuild/reload the Vite frontend and upload this sketch. No MQTT broker or
+   additional client library is required; the existing private Supabase
+   Realtime channel is reused.
+4. Confirm the admin user can subscribe to the device's `device-ecg:<id>` topic.
+   Serial Monitor should show slow summary HTTP 200 responses. The graph badge
+   should report the live stream and show a trace only when fresh packets have
+   usable samples and both lead-off flags are clear.

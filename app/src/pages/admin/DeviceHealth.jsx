@@ -7,7 +7,9 @@ const INVENTORY_REFRESH_MS = 30_000;
 const HISTORY_REFRESH_MS = 30_000;
 const LIVE_REFRESH_MS = 1_000;
 const HISTORY_WINDOW_MS = 10 * 60 * 1_000;
+const PULSE_CHART_WINDOW_MS = 30 * 1_000;
 const LIVE_WINDOW_MS = 10_000;
+const READING_VALUE_STALE_MS = 3 * 60 * 1_000;
 const CONFIG_MODULE_KEYS = ["MAX30102", "AD8232", "MPU6050", "VL53L0X"];
 const MODULE_LABELS = {
   MAX30102: { title: "Heart-rate optical reader", description: "Shows raw RED/IR samples and an experimental pulse-rate estimate. This firmware does not calculate SpO₂." },
@@ -70,7 +72,9 @@ export default function DeviceHealth() {
   const [health, setHealth] = useState(null);
   const [liveReadings, setLiveReadings] = useState([]);
   const [ecgBatches, setEcgBatches] = useState([]);
+  const [ecgPackets, setEcgPackets] = useState([]);
   const [ecgFeedError, setEcgFeedError] = useState(false);
+  const [ecgStreamError, setEcgStreamError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState("");
@@ -79,7 +83,13 @@ export default function DeviceHealth() {
   const [configVersion, setConfigVersion] = useState(0);
   const [configSaving, setConfigSaving] = useState(false);
   const [configMessage, setConfigMessage] = useState("");
+  const [displayClock, setDisplayClock] = useState(() => Date.now());
   const initialLoadStartedForRef = useRef(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setDisplayClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const loadDevices = useCallback(async (initial = false) => {
     if (initial) setLoading(true);
@@ -177,6 +187,10 @@ export default function DeviceHealth() {
   useEffect(() => {
     if (!selectedId) return undefined;
     let current = true;
+    // Reset the per-device stream while switching Realtime topics.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setEcgPackets([]);
+    setEcgStreamError(false);
     let inFlight = false;
     let since = null;
     let timer = null;
@@ -228,10 +242,21 @@ export default function DeviceHealth() {
         setEcgFeedError(false);
         mergeBatches([batch]);
       })
+      .on("broadcast", { event: "ecg_packet" }, (message) => {
+        if (!current) return;
+        const packet = message?.payload?.packet ?? message?.payload?.payload ?? message?.payload;
+        if (Number(packet?.device_id) !== Number(selectedId) ||
+          !Array.isArray(packet?.samples) || packet.samples.length < 10 || packet.samples.length > 20) return;
+        setEcgPackets((existing) => {
+          if (existing.some((item) => item.packet_sequence === packet.packet_sequence)) return existing;
+          return [...existing, packet].slice(-200);
+        });
+      })
       .subscribe((status) => {
         if (!current) return;
         if (status === "SUBSCRIBED") {
           realtimeConnected = true;
+          setEcgStreamError(false);
           setEcgFeedError(false);
           // Reconcile after joining so batches committed during the initial
           // fetch / WebSocket handshake are not missed.
@@ -241,6 +266,7 @@ export default function DeviceHealth() {
           setReconciliationRate(1_000);
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           realtimeConnected = false;
+          setEcgStreamError(true);
           setEcgFeedError(true);
           setReconciliationRate(1_000);
         }
@@ -316,7 +342,30 @@ export default function DeviceHealth() {
 
   const device = health?.device;
   const readings = health?.readings || [];
+  const pulseChartReadings = readings.filter((reading) => {
+    const recordedAt = new Date(reading.recorded_at).getTime();
+    const age = displayClock - recordedAt;
+    return Number.isFinite(recordedAt) && age >= 0 && age <= PULSE_CHART_WINDOW_MS;
+  });
   const latest = liveReadings[0] || readings[0];
+  const getFreshSample = (field) => {
+    const sample = [...liveReadings, ...readings]
+      .filter((reading) => reading[field] !== null && reading[field] !== undefined && reading.recorded_at)
+      .sort((left, right) => new Date(right.recorded_at) - new Date(left.recorded_at))[0];
+    if (!sample) return null;
+    const age = displayClock - new Date(sample.recorded_at).getTime();
+    return Number.isFinite(age) && age <= READING_VALUE_STALE_MS ? sample : null;
+  };
+  const pulseSample = getFreshSample("pulse_rate_estimate_bpm");
+  const redSample = getFreshSample("red_raw");
+  const irSample = getFreshSample("ir_raw");
+  const distanceSample = getFreshSample("distance_mm");
+  const ecgSample = getFreshSample("ecg_value");
+  const leadPositiveSample = getFreshSample("ecg_lead_off_positive");
+  const leadNegativeSample = getFreshSample("ecg_lead_off_negative");
+  const motionXSample = getFreshSample("motion_x");
+  const motionYSample = getFreshSample("motion_y");
+  const motionZSample = getFreshSample("motion_z");
 
   return (
     <div className="admin-page device-health-page">
@@ -377,20 +426,20 @@ export default function DeviceHealth() {
           {!device.has_patient_assignment ? <div className="clinical-empty">This device has no assigned patient. Assign it from Devices before uploading patient readings: device-ingest rejects unassigned devices, and this page only shows readings linked to the current assignment.</div> : !latest ? <div className="clinical-empty">No readings have been received for this device and its current patient in the selected time range. Check device connection, credential, ingest response, and whether the migrations and Edge Function are deployed.</div> : (
             <dl className="device-health-vitals">
               <div><dt>Recorded at</dt><dd>{formatDate(latest.recorded_at)}</dd></div>
-              <div><dt>Pulse-rate estimate (prototype)</dt><dd>{latest.pulse_rate_estimate_bpm == null ? "Waiting for a stable optical pulse" : display(latest.pulse_rate_estimate_bpm, " bpm")}</dd></div>
-              <div><dt>Raw RED (window average)</dt><dd>{display(latest.red_raw)}</dd></div>
-              <div><dt>Raw IR (window average)</dt><dd>{display(latest.ir_raw)}</dd></div>
-              <div><dt>Distance</dt><dd>{display(latest.distance_mm, " mm")}</dd></div>
-              <div><dt>ECG raw ADC sample</dt><dd>{latest.sensor_status?.ecg_sensor === "ok" ? display(latest.ecg_value) : "Unavailable · check leads"}</dd></div>
-              <div><dt>ECG leads</dt><dd>{latest.ecg_lead_off_positive == null && latest.ecg_lead_off_negative == null ? "Unavailable" : `${latest.ecg_lead_off_positive ? "LO+ off" : "LO+ connected"} · ${latest.ecg_lead_off_negative ? "LO− off" : "LO− connected"}`}</dd></div>
-              <div><dt>Movement X / Y / Z</dt><dd>{[latest.motion_x, latest.motion_y, latest.motion_z].map((value) => display(value, " g")).join(" / ")}</dd></div>
+              <div><dt>Pulse-rate estimate (prototype)</dt><dd>{pulseSample ? display(pulseSample.pulse_rate_estimate_bpm, " bpm") : "—"}</dd></div>
+              <div><dt>Raw RED (window average)</dt><dd>{redSample ? display(redSample.red_raw) : "—"}</dd></div>
+              <div><dt>Raw IR (window average)</dt><dd>{irSample ? display(irSample.ir_raw) : "—"}</dd></div>
+              <div><dt>Distance</dt><dd>{distanceSample ? display(distanceSample.distance_mm, " mm") : "—"}</dd></div>
+              <div><dt>ECG raw ADC sample</dt><dd>{!ecgSample ? "—" : ecgSample.sensor_status?.ecg_sensor === "ok" ? display(ecgSample.ecg_value) : "Unavailable · check leads"}</dd></div>
+              <div><dt>ECG leads</dt><dd>{!leadPositiveSample && !leadNegativeSample ? "—" : `${leadPositiveSample ? (leadPositiveSample.ecg_lead_off_positive ? "LO+ off" : "LO+ connected") : "LO+ —"} · ${leadNegativeSample ? (leadNegativeSample.ecg_lead_off_negative ? "LO− off" : "LO− connected") : "LO− —"}`}</dd></div>
+              <div><dt>Movement X / Y / Z</dt><dd>{[motionXSample, motionYSample, motionZSample].map((sample, index) => sample ? display(sample[["motion_x", "motion_y", "motion_z"][index]], " g") : "—").join(" / ")}</dd></div>
             </dl>
           )}
         </section>
 
         {device.has_patient_assignment && <>
           {latest && <section className="panel-card device-health-panel"><h3>Sensor status</h3><ul className="device-health-diagnostics">{visibleSensorEntries(latest.sensor_status).map(([key, status]) => <li key={key}><span>{SENSOR_STATUS_LABELS[key] || key}</span><strong>{status.replaceAll("_", " ")}</strong></li>)}</ul>{visibleSensorEntries(latest.sensor_errors).length > 0 && <div className="clinical-message clinical-error" role="status">{visibleSensorEntries(latest.sensor_errors).map(([key, message]) => <div key={key}>{SENSOR_STATUS_LABELS[key] || key}: {message}</div>)}</div>}</section>}
-          <div className="device-health-details"><ReadingChart readings={readings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate · last 10 minutes (prototype)" unit="bpm"/><EcgMonitor batches={ecgBatches} feedError={ecgFeedError}/></div>
+          <div className="device-health-details"><ReadingChart readings={pulseChartReadings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate · last 30 seconds (prototype)" unit="bpm"/><EcgMonitor batches={ecgBatches} livePackets={ecgPackets} feedError={ecgFeedError || ecgStreamError}/></div>
         </>}
       </>}
     </div>

@@ -124,7 +124,17 @@ export default function ClinicalDashboard({ role }) {
       console.error("Medication worklist request failed:", worklistError);
       setMedicationTasks([]);
       setAssignedNurses([]);
-      setMedicationError("Medication tasks could not be loaded. Confirm the medication workflow migration is deployed, then refresh.");
+      const errorCode = worklistError?.code;
+      const errorMessage = String(worklistError?.message || "");
+      if (errorCode === "PGRST202" || errorCode === "42883" || /get_my_medication_worklist.*(?:not found|does not exist)/i.test(errorMessage)) {
+        setMedicationError("Medication tasks are unavailable because the medication workflow migration is not active on this Supabase project. Apply the pending migrations, then refresh.");
+      } else if (errorCode === "42501") {
+        setMedicationError("Medication tasks are blocked by a database permission error. Check the medication workflow RPC grants and retry.");
+      } else if (errorCode === "PGRST301" || errorCode === "401") {
+        setMedicationError("Your session could not access medication tasks. Sign in again and refresh.");
+      } else {
+        setMedicationError(`Medication tasks could not be loaded${errorCode ? ` (error ${errorCode})` : ""}. Refresh and contact your administrator if this continues.`);
+      }
     } finally {
       setMedicationLoading(false);
     }

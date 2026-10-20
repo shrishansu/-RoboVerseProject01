@@ -12,7 +12,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS vital_readings_device_ingestion_id_uidx
   ON public.vital_readings(device_id, ingestion_id) WHERE ingestion_id IS NOT NULL;
 
 DROP FUNCTION IF EXISTS public.get_device_health_data(bigint);
-CREATE FUNCTION public.get_device_health_data(
+CREATE OR REPLACE FUNCTION public.get_device_health_data(
   p_device_id bigint, p_from timestamptz DEFAULT NULL, p_to timestamptz DEFAULT NULL
 ) RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $function$
 DECLARE v_role text; v_hospital_id bigint; v_device record; v_result jsonb;
