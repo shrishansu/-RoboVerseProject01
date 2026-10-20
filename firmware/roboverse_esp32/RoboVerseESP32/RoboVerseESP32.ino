@@ -17,6 +17,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include "MAX30105.h"              // SparkFun MAX3010x Sensor Library
 #include <Adafruit_MPU6050.h>      // Adafruit MPU6050 + Adafruit Unified Sensor
 #include <Adafruit_Sensor.h>
@@ -40,6 +41,11 @@ static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
 static constexpr uint16_t ECG_SAMPLE_RATE_HZ = 250;
 static constexpr uint16_t ECG_BATCH_SAMPLES = ECG_SAMPLE_RATE_HZ;
 static constexpr uint32_t ECG_SAMPLE_PERIOD_MS = 1000 / ECG_SAMPLE_RATE_HZ;
+// Keep short network/Edge Function delays from discarding otherwise valid
+// raw batches. Timestamps remain the original capture times; they are never
+// rewritten to make delayed samples appear live.
+static constexpr uint32_t ECG_MAX_QUEUE_AGE_MS = 10000;
+static constexpr UBaseType_t ECG_QUEUE_BATCHES = 20;
 static const String INGEST_URL = String(SUPABASE_PROJECT_URL) + "/functions/v1/device-ingest";
 
 MAX30105 max30102;
@@ -60,10 +66,23 @@ struct EcgBatch {
   bool leadOffPositive;
   bool leadOffNegative;
   bool saturated;
+  uint16_t minimumSample;
+  uint16_t maximumSample;
+  uint32_t startedAtMillis;
   uint64_t startedEpochMs;
   char batchId[37];
 };
 QueueHandle_t ecgBatchQueue=nullptr;
+SemaphoreHandle_t sensorI2cMutex=nullptr;
+portMUX_TYPE opticalMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct OpticalSnapshot {
+  uint64_t redSum;
+  uint64_t irSum;
+  uint32_t samples;
+  float pulseBpm;
+  bool pulseValid;
+};
 
 // Small, non-clinical peak interval estimator. A reading is omitted until at
 // least two plausible, recent beat intervals have been detected.
@@ -74,9 +93,21 @@ uint16_t beatIntervals[4]={0}; uint8_t beatCount=0, beatIndex=0;
 float pulseEstimate= NAN;
 
 bool sensorHasCert() {
-  return strlen(SUPABASE_ROOT_CA) > 100 && strstr(SUPABASE_ROOT_CA, "BEGIN CERTIFICATE") != nullptr;
+  const char* pem = SUPABASE_ROOT_CA;
+  while (*pem == '\r' || *pem == '\n' || *pem == ' ' || *pem == '\t') ++pem;
+  return strlen(pem) > 100 && strncmp(pem, "-----BEGIN CERTIFICATE-----", 27) == 0;
 }
 bool tlsClockReady() { return time(nullptr) > 1700000000; }
+bool hasTrustedBatchTimestamp(const EcgBatch* batch) {
+  if (!batch || !batch->startedEpochMs) return false;
+  const time_t nowSeconds = time(nullptr);
+  if (nowSeconds <= 1700000000) return false;
+  const uint64_t nowEpochMs = static_cast<uint64_t>(nowSeconds) * 1000ULL;
+  const uint64_t differenceMs = batch->startedEpochMs > nowEpochMs
+    ? batch->startedEpochMs - nowEpochMs
+    : nowEpochMs - batch->startedEpochMs;
+  return differenceMs <= 30000;
+}
 void buzzerSet(bool on) {
 #if BUZZER_ENABLED
   digitalWrite(PIN_BUZZER, (on == (BUZZER_ACTIVE_HIGH != 0)) ? HIGH : LOW);
@@ -102,14 +133,25 @@ void detectPulse(uint32_t ir) {
   } else if (peakRising) {
     peakRising = false;
     const float amplitude = peakValue;
-    const uint32_t interval = now - lastPeakAt;
-    if (amplitude > 250.0f && lastPeakAt != 0 && interval >= 300 && interval <= 2000) {
-      beatIntervals[beatIndex++ % 4] = static_cast<uint16_t>(interval);
-      if (beatCount < 4) beatCount++;
-      uint32_t sum=0; for (uint8_t i=0;i<beatCount;i++) sum += beatIntervals[i];
-      pulseEstimate = 60000.0f * beatCount / sum;
-      lastPeakAt = now;
-    } else if (amplitude > 250.0f && lastPeakAt == 0) {
+    // Use a small threshold relative to the current IR level so ordinary
+    // MAX30102 signal amplitudes are not rejected by a fixed 250-count gate.
+    // This remains an experimental estimate; implausible intervals reset it.
+    const float minimumPulseAmplitude = max(12.0f, irBaseline * 0.015f);
+    if (amplitude >= minimumPulseAmplitude) {
+      if (lastPeakAt != 0) {
+        const uint32_t interval = now - lastPeakAt;
+        if (interval >= 300 && interval <= 2000) {
+          beatIntervals[beatIndex++ % 4] = static_cast<uint16_t>(interval);
+          if (beatCount < 4) beatCount++;
+          uint32_t sum=0; for (uint8_t i=0;i<beatCount;i++) sum += beatIntervals[i];
+          pulseEstimate = 60000.0f * beatCount / sum;
+        } else {
+          beatCount = 0;
+          pulseEstimate = NAN;
+        }
+      }
+      // Always move the peak reference forward, including after a missed or
+      // implausible beat, so the estimator can recover instead of staying blank.
       lastPeakAt = now;
     }
     peakValue = 0;
@@ -118,6 +160,22 @@ void detectPulse(uint32_t ir) {
 }
 bool pulseEstimateValid() {
   return beatCount >= 2 && !isnan(pulseEstimate) && millis()-lastPeakAt < 10000 && pulseEstimate >= 30 && pulseEstimate <= 200;
+}
+OpticalSnapshot takeOpticalSnapshot(bool resetWindow) {
+  OpticalSnapshot snapshot{};
+  portENTER_CRITICAL(&opticalMux);
+  snapshot.redSum = redSum;
+  snapshot.irSum = irSum;
+  snapshot.samples = opticalSamples;
+  snapshot.pulseBpm = pulseEstimate;
+  snapshot.pulseValid = pulseEstimateValid();
+  if (resetWindow) {
+    redSum = 0;
+    irSum = 0;
+    opticalSamples = 0;
+  }
+  portEXIT_CRITICAL(&opticalMux);
+  return snapshot;
 }
 
 void initSensors() {
@@ -211,9 +269,19 @@ void runSensorDiagnostics() {
   Serial.println("[CHECK 4/5] AD8232 ECG front-end: sampling analog input and lead-off pins...");
   leadOffPlus = digitalRead(PIN_ECG_LO_PLUS) == HIGH;
   leadOffMinus = digitalRead(PIN_ECG_LO_MINUS) == HIGH;
-  ecgLatest = analogRead(PIN_ECG);
-  Serial.printf("[CHECK RESULT] AD8232 pins: ADC=%d, LO+=%s, LO-=%s. Lead-off is expected when leads are disconnected; this does not validate an ECG.\n",
-    ecgLatest, leadOffPlus ? "OFF" : "ON", leadOffMinus ? "OFF" : "ON");
+  uint16_t checkMin = 4095, checkMax = 0;
+  uint32_t checkSum = 0;
+  for (uint8_t i = 0; i < 32; ++i) {
+    const uint16_t sample = static_cast<uint16_t>(analogRead(PIN_ECG));
+    checkMin = min(checkMin, sample);
+    checkMax = max(checkMax, sample);
+    checkSum += sample;
+    delay(4);
+  }
+  ecgLatest = static_cast<int>(checkSum / 32);
+  Serial.printf("[CHECK RESULT] AD8232 ADC range: min=%u max=%u mean=%u; LO+=%s, LO-=%s. Lead-off pins do not validate the analog signal.\n",
+    static_cast<unsigned int>(checkMin), static_cast<unsigned int>(checkMax), static_cast<unsigned int>(ecgLatest),
+    leadOffPlus ? "OFF" : "ON", leadOffMinus ? "OFF" : "ON");
 
   Serial.println("[CHECK 5/5] Buzzer: output is disabled in this firmware; no sound test was sent.");
   Serial.println("[CHECK] Sequential checks complete. Starting normal sensor collection and uploads.");
@@ -222,6 +290,7 @@ void runSensorDiagnostics() {
 void retryMissingSensors() {
   if (millis()-lastSensorRetry < 10000) return;
   lastSensorRetry=millis();
+  if (sensorI2cMutex) xSemaphoreTake(sensorI2cMutex, portMAX_DELAY);
   if (!maxReady) {
     maxReady=max30102.begin(Wire,I2C_SPEED_FAST);
     if (maxReady) { max30102.setup(0x1F,4,2,100,411,4096); max30102.setPulseAmplitudeRed(0x1F); max30102.setPulseAmplitudeIR(0x1F); max30102.setPulseAmplitudeGreen(0); }
@@ -235,6 +304,7 @@ void retryMissingSensors() {
     }
   }
   if (!vl53Ready) vl53Ready=vl53l0x.begin();
+  if (sensorI2cMutex) xSemaphoreGive(sensorI2cMutex);
 }
 
 void maintainWifi() {
@@ -244,12 +314,28 @@ void maintainWifi() {
   Serial.println("[Wi-Fi] Reconnecting.");
 }
 void collectOptical() {
-  if (!maxReady) return;
+  if (sensorI2cMutex && xSemaphoreTake(sensorI2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+  if (!maxReady) {
+    if (sensorI2cMutex) xSemaphoreGive(sensorI2cMutex);
+    return;
+  }
   max30102.check();
   while (max30102.available()) {
-    redLatest=max30102.getFIFORed(); irLatest=max30102.getFIFOIR();
-    redSum+=redLatest; irSum+=irLatest; opticalSamples++;
-    detectPulse(irLatest); max30102.nextSample();
+    const uint32_t red = max30102.getFIFORed();
+    const uint32_t ir = max30102.getFIFOIR();
+    max30102.nextSample();
+    portENTER_CRITICAL(&opticalMux);
+    redLatest=red; irLatest=ir;
+    redSum+=red; irSum+=ir; opticalSamples++;
+    detectPulse(ir);
+    portEXIT_CRITICAL(&opticalMux);
+  }
+  if (sensorI2cMutex) xSemaphoreGive(sensorI2cMutex);
+}
+void opticalSamplerTask(void*) {
+  for (;;) {
+    collectOptical();
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 void makeBatchId(char* out, size_t capacity) {
@@ -267,16 +353,22 @@ void ecgSamplerTask(void*) {
   for (;;) {
     EcgBatch batch{};
     batch.sampleCount = ECG_BATCH_SAMPLES;
-    timeval startTime{};
-    gettimeofday(&startTime, nullptr);
-    if (startTime.tv_sec > 1700000000) {
-      batch.startedEpochMs = static_cast<uint64_t>(startTime.tv_sec) * 1000 + startTime.tv_usec / 1000;
+    batch.minimumSample = 4095;
+    batch.maximumSample = 0;
+    batch.startedAtMillis = millis();
+    timeval captureTime{};
+    gettimeofday(&captureTime, nullptr);
+    if (captureTime.tv_sec > 1700000000) {
+      batch.startedEpochMs = static_cast<uint64_t>(captureTime.tv_sec) * 1000ULL +
+        static_cast<uint64_t>(captureTime.tv_usec / 1000);
     }
     for (uint16_t i = 0; i < ECG_BATCH_SAMPLES; ++i) {
       const bool loPlus = digitalRead(PIN_ECG_LO_PLUS) == HIGH;
       const bool loMinus = digitalRead(PIN_ECG_LO_MINUS) == HIGH;
       const int sample = analogRead(PIN_ECG);
       batch.samples[i] = static_cast<uint16_t>(sample);
+      batch.minimumSample = min(batch.minimumSample, batch.samples[i]);
+      batch.maximumSample = max(batch.maximumSample, batch.samples[i]);
       batch.leadOffPositive |= loPlus;
       batch.leadOffNegative |= loMinus;
       batch.saturated |= sample == 0 || sample == 4095;
@@ -288,10 +380,13 @@ void ecgSamplerTask(void*) {
     makeBatchId(batch.batchId, sizeof(batch.batchId));
     // A full queue means upload has been unavailable for several seconds.
     // Drop this completed batch rather than ever blocking the 250 Hz sampler.
-    if (ecgBatchQueue) xQueueSend(ecgBatchQueue, &batch, 0);
+    if (ecgBatchQueue && xQueueSend(ecgBatchQueue, &batch, 0) != pdTRUE) {
+      Serial.println("[ECG] Queue full: newest batch discarded; check upload latency/Wi-Fi.");
+    }
   }
 }
 void collectPeriodicSensors() {
+  if (sensorI2cMutex) xSemaphoreTake(sensorI2cMutex, portMAX_DELAY);
   accelX=accelY=accelZ=NAN; distanceMm=-1;
   if (mpuReady) {
     sensors_event_t a,g,temp; mpu6050.getEvent(&a,&g,&temp);
@@ -301,26 +396,27 @@ void collectPeriodicSensors() {
     VL53L0X_RangingMeasurementData_t measure; vl53l0x.rangingTest(&measure, false);
     distanceMm=(measure.RangeStatus != 4 && measure.RangeMilliMeter > 0) ? measure.RangeMilliMeter : -1;
   }
+  if (sensorI2cMutex) xSemaphoreGive(sensorI2cMutex);
 }
 String jsonNumber(float value, unsigned int digits=2) {
   if (!isfinite(value)) return "null";
   return String(value, digits);
 }
-String buildPayload(const EcgBatch* batch) {
+String buildPayload(const EcgBatch* batch, const OpticalSnapshot& optical) {
   String body; body.reserve(2600);
   body="{\"device_id\":"+String(ROBO_VERSE_DEVICE_ID);
-  // The server records the accepted timestamp; firmware does not send an
-  // unsynchronized local clock value.
-  const bool pulseOk=pulseEstimateValid();
-  const String heartStatus=!maxReady ? "unavailable" : (!opticalSamples ? "no_samples" : (pulseOk ? "pulse_estimate_available" : "raw_samples_only"));
+  // Use the sample-time clock only when NTP is synchronized and the batch is
+  // recent. Otherwise omit it and let the server apply its receive-time fallback.
+  const bool pulseOk=optical.pulseValid;
+  const String heartStatus=!maxReady ? "unavailable" : (!optical.samples ? "no_samples" : (pulseOk ? "pulse_estimate_available" : "raw_samples_only"));
   const String movementStatus=!mpuReady ? "unavailable" : (isfinite(accelX) ? "ok" : "no_measurement");
   const String distanceStatus=!vl53Ready ? "unavailable" : (distanceMm>=0 ? "ok" : "no_range");
   const bool ecgHasLeadOff = batch && (batch->leadOffPositive || batch->leadOffNegative);
   const bool ecgSaturated = batch && batch->saturated;
   const String ecgStatus=!batch ? "no_samples" : (ecgSaturated ? "signal_saturated" : (ecgHasLeadOff ? "lead_off" : "ok"));
-  body+=",\"pulse_rate_estimate_bpm\":"+(pulseOk ? String(pulseEstimate,1) : "null");
-  body+=",\"red_raw\":"+(opticalSamples ? String((uint32_t)(redSum/opticalSamples)) : "null");
-  body+=",\"ir_raw\":"+(opticalSamples ? String((uint32_t)(irSum/opticalSamples)) : "null");
+  body+=",\"pulse_rate_estimate_bpm\":"+(pulseOk ? String(optical.pulseBpm,1) : "null");
+  body+=",\"red_raw\":"+(optical.samples ? String((uint32_t)(optical.redSum/optical.samples)) : "null");
+  body+=",\"ir_raw\":"+(optical.samples ? String((uint32_t)(optical.irSum/optical.samples)) : "null");
   body+=",\"signal_valid\":"+String(pulseOk ? "true" : "false");
   body+=",\"motion_x\":"+jsonNumber(accelX)+",\"motion_y\":"+jsonNumber(accelY)+",\"motion_z\":"+jsonNumber(accelZ);
   // Preserve the legacy table's single raw point using the final unfiltered
@@ -333,13 +429,14 @@ String buildPayload(const EcgBatch* batch) {
     body+=",\"ecg_samples\":[";
     for (uint16_t i=0; i<batch->sampleCount; ++i) { if(i) body+=","; body+=String(batch->samples[i]); }
     body+="]";
-    if (batch->startedEpochMs) {
-      const time_t seconds = static_cast<time_t>(batch->startedEpochMs / 1000);
-      struct tm utc{}; gmtime_r(&seconds, &utc);
+    if (hasTrustedBatchTimestamp(batch)) {
+      const time_t batchSeconds = static_cast<time_t>(batch->startedEpochMs / 1000ULL);
+      struct tm utc{};
+      gmtime_r(&batchSeconds, &utc);
       char timestamp[32];
-      snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.%03lluZ",
-        utc.tm_year+1900, utc.tm_mon+1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
-        static_cast<unsigned long long>(batch->startedEpochMs % 1000));
+      snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d.%03uZ",
+        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
+        static_cast<unsigned int>(batch->startedEpochMs % 1000ULL));
       body+=",\"ecg_batch_started_at\":\""+String(timestamp)+"\"";
     }
   }
@@ -347,7 +444,7 @@ String buildPayload(const EcgBatch* batch) {
   body+=",\"sensor_status\":{\"heart_reader\":\""+heartStatus+"\",\"movement_sensor\":\""+movementStatus+"\",\"distance_sensor\":\""+distanceStatus+"\",\"ecg_sensor\":\""+ecgStatus+"\"}";
   body+=",\"sensor_errors\":{";
   bool first=true;
-  if (!maxReady || !opticalSamples) { body+="\"heart_reader\":\""+String(maxReady?"No optical samples in this upload window":"MAX30102 not detected")+"\""; first=false; }
+  if (!maxReady || !optical.samples) { body+="\"heart_reader\":\""+String(maxReady?"No optical samples in this upload window":"MAX30102 not detected")+"\""; first=false; }
   if (!mpuReady || !isfinite(accelX)) { if(!first) body+=","; body+="\"movement_sensor\":\""+String(mpuReady?"No acceleration sample":"MPU6050 not detected")+"\""; first=false; }
   if (!vl53Ready || distanceMm<0) { if(!first) body+=","; body+="\"distance_sensor\":\""+String(vl53Ready?"No valid distance in this sample":"VL53L0X not detected")+"\""; first=false; }
   if (batch && (ecgHasLeadOff||ecgSaturated)) {
@@ -368,8 +465,24 @@ void uploadReading() {
   if (!sensorHasCert()) { Serial.println("[TLS] secrets.h needs the HTTPS root CA PEM; no upload attempted."); return; }
   if (!tlsClockReady()) { Serial.println("[TLS] Waiting for network time."); return; }
   EcgBatch batch{};
-  const bool hasBatch = ecgBatchQueue && xQueuePeek(ecgBatchQueue, &batch, 0) == pdTRUE;
-  String body=buildPayload(hasBatch ? &batch : nullptr);
+  bool hasBatch = ecgBatchQueue && xQueuePeek(ecgBatchQueue, &batch, 0) == pdTRUE;
+  while (hasBatch && static_cast<uint32_t>(millis() - batch.startedAtMillis) > ECG_MAX_QUEUE_AGE_MS) {
+    EcgBatch expired{};
+    xQueueReceive(ecgBatchQueue, &expired, 0);
+    Serial.println("[ECG] Dropped a batch older than 10 s; capture timestamp is preserved for every batch sent.");
+    hasBatch = xQueuePeek(ecgBatchQueue, &batch, 0) == pdTRUE;
+  }
+  const OpticalSnapshot optical = takeOpticalSnapshot(true);
+  String body=buildPayload(hasBatch ? &batch : nullptr, optical);
+  if (hasBatch) {
+    Serial.printf("[ECG] ADC batch range: min=%u max=%u; lead-off +/-%s/%s; sample timestamp: %s; payload bytes: %u\n",
+      static_cast<unsigned int>(batch.minimumSample), static_cast<unsigned int>(batch.maximumSample),
+      batch.leadOffPositive ? "OFF" : "ON", batch.leadOffNegative ? "OFF" : "ON",
+      hasTrustedBatchTimestamp(&batch) ? "NTP synchronized" : "server fallback",
+      (unsigned)body.length());
+  } else {
+    Serial.printf("[ECG] No ECG batch in payload; payload bytes: %u\n", (unsigned)body.length());
+  }
   WiFiClientSecure tls; tls.setCACert(SUPABASE_ROOT_CA);
   HTTPClient http; http.setConnectTimeout(HTTP_TIMEOUT_MS); http.setTimeout(HTTP_TIMEOUT_MS); http.setReuse(false);
   if (!http.begin(tls,INGEST_URL)) { Serial.println("[UPLOAD] HTTPS initialization failed."); return; }
@@ -377,37 +490,53 @@ void uploadReading() {
   http.addHeader("apikey",SUPABASE_ANON_KEY);
   http.addHeader("x-device-id",String(ROBO_VERSE_DEVICE_ID));
   http.addHeader("x-device-secret",ROBO_VERSE_DEVICE_SECRET);
+  const uint32_t uploadStartedAt = millis();
   int status=http.POST(body);
-  Serial.printf("[UPLOAD] Device ID %d, HTTP %d, RED/IR samples %lu, pulse estimate %s.\n", ROBO_VERSE_DEVICE_ID,status,(unsigned long)opticalSamples,pulseEstimateValid()?"available":"unavailable");
+  const uint32_t uploadDurationMs = millis() - uploadStartedAt;
+  Serial.printf("[UPLOAD] Request duration: %lu ms; ECG queue depth: %u/%u; oldest batch age: %lu ms.\n",
+    static_cast<unsigned long>(uploadDurationMs),
+    static_cast<unsigned int>(ecgBatchQueue ? uxQueueMessagesWaiting(ecgBatchQueue) : 0),
+    static_cast<unsigned int>(ECG_QUEUE_BATCHES),
+    static_cast<unsigned long>(hasBatch ? millis() - batch.startedAtMillis : 0));
+  Serial.printf("[UPLOAD] Device ID %d, HTTP %d, RED/IR samples %lu, pulse estimate %s.\n", ROBO_VERSE_DEVICE_ID,status,(unsigned long)optical.samples,optical.pulseValid?"available":"unavailable");
   if (status<200 || status>=300) { String response=http.getString(); if(response.length()) Serial.printf("[UPLOAD] Server response: %s\n",response.c_str()); }
   http.end();
   if (status >= 200 && status < 300 && hasBatch) {
     EcgBatch sent{};
     xQueueReceive(ecgBatchQueue, &sent, 0);
   }
-  redSum=irSum=0; opticalSamples=0;
 }
 
 void setup() {
   Serial.begin(115200); delay(100);
-  analogReadResolution(12); pinMode(PIN_ECG_LO_PLUS,INPUT); pinMode(PIN_ECG_LO_MINUS,INPUT);
+  analogReadResolution(12);
+  // GPIO34 is an ADC1 input. Explicit 11 dB attenuation provides the ESP32's
+  // broadest supported input range; samples remain raw and unfiltered.
+  pinMode(PIN_ECG, INPUT);
+  analogSetPinAttenuation(PIN_ECG, ADC_11db);
+  pinMode(PIN_ECG_LO_PLUS,INPUT); pinMode(PIN_ECG_LO_MINUS,INPUT);
 #if BUZZER_ENABLED
   pinMode(PIN_BUZZER,OUTPUT); buzzerSet(false);
 #else
   pinMode(PIN_BUZZER,INPUT); // High-impedance while the optional module is disabled.
 #endif
-  Wire.begin(PIN_SDA,PIN_SCL); scanI2cBus(); initSensors(); runSensorDiagnostics();
-  ecgBatchQueue=xQueueCreate(10,sizeof(EcgBatch));
+  Wire.begin(PIN_SDA,PIN_SCL);
+  sensorI2cMutex=xSemaphoreCreateMutex();
+  scanI2cBus(); initSensors(); runSensorDiagnostics();
+  ecgBatchQueue=xQueueCreate(ECG_QUEUE_BATCHES,sizeof(EcgBatch));
   if (ecgBatchQueue) {
     xTaskCreatePinnedToCore(ecgSamplerTask,"ecg-sampler",4096,nullptr,3,nullptr,1);
     Serial.println("[ECG] Raw ADC acquisition: 250 Hz, 250 samples per batch.");
   } else Serial.println("[ECG] ERROR: Could not create raw sample queue.");
+  if (xTaskCreatePinnedToCore(opticalSamplerTask,"max30102-reader",4096,nullptr,2,nullptr,1) == pdPASS)
+    Serial.println("[MAX30102] FIFO sampling runs independently of HTTPS uploads.");
+  else Serial.println("[MAX30102] ERROR: Could not create independent optical sampler task.");
   WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); WiFi.begin(WIFI_SSID,WIFI_PASSWORD); lastWifiTry=millis();
   configTime(0,0,"pool.ntp.org","time.google.com"); lastUpload=millis(); statusChirp();
   Serial.printf("[DEVICE] Numeric database ID %d. Pulse estimate is educational; no SpO2 is sent.\n",ROBO_VERSE_DEVICE_ID);
 }
 void loop() {
-  maintainWifi(); retryMissingSensors(); collectOptical();
+  maintainWifi(); retryMissingSensors();
   if (millis()-lastUpload>=UPLOAD_MS) { lastUpload=millis(); collectPeriodicSensors(); uploadReading(); }
   delay(1);
 }

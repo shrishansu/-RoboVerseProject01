@@ -84,7 +84,22 @@ function isValidNumber(value: unknown): boolean {
   );
 }
 
-function logDatabaseFailure(stage: string, diagnosticId: string, code?: string) {
+function classifyDatabaseFailure(error: { message?: string } | null | undefined): string {
+  const message = error?.message?.toLowerCase() || "";
+  if (message.includes("row-level security") || message.includes("row level security")) return "rls_policy";
+  if (message.includes("permission denied for schema")) return "schema_privilege";
+  if (message.includes("permission denied for table")) return "table_privilege";
+  if (message.includes("permission denied for sequence")) return "sequence_privilege";
+  if (message.includes("permission denied for function")) return "function_privilege";
+  if (message.includes("permission denied")) return "object_privilege";
+  return "other_database_error";
+}
+
+function logDatabaseFailure(
+  stage: string,
+  diagnosticId: string,
+  error?: string | { code?: string; message?: string } | null,
+) {
   // Never log request headers, device secrets, password hashes, patient IDs,
   // or raw database error objects. The diagnostic ID joins this event to the
   // generic 500 response returned to the device.
@@ -92,7 +107,8 @@ function logDatabaseFailure(stage: string, diagnosticId: string, code?: string) 
     event: "device_ingest_database_failure",
     diagnostic_id: diagnosticId,
     stage,
-    database_code: code || "unknown",
+    database_code: typeof error === "string" ? error : error?.code || "unknown",
+    database_error_kind: classifyDatabaseFailure(typeof error === "string" ? null : error),
   }));
 }
 
@@ -155,96 +171,6 @@ Deno.serve(async (req: Request) => {
       return jsonResponse(
         {
           error: "Invalid device secret",
-        },
-        401,
-      );
-    }
-
-    // ========================================================
-    // FIND ACTIVE DEVICE CREDENTIAL
-    // ========================================================
-
-    const {
-      data: credential,
-      error: credentialError,
-    } = await supabase
-      .from("device_credentials")
-      .select(`
-        id,
-        device_id,
-        secret_hash,
-        status
-      `)
-      .eq("device_id", deviceId)
-      .eq("status", "active")
-      .maybeSingle();
-
-    if (credentialError) {
-      logDatabaseFailure("credential_lookup", diagnosticId, credentialError.code);
-
-      return jsonResponse(
-        {
-          error:
-            "Authentication service error",
-          diagnostic_id: diagnosticId,
-        },
-        500,
-      );
-    }
-
-    if (!credential) {
-      console.warn(JSON.stringify({
-        event: "device_credential_rejected",
-        diagnostic_id: diagnosticId,
-        reason: "missing_or_inactive_credential",
-      }));
-      return jsonResponse(
-        {
-          error:
-            "Invalid device credentials",
-        },
-        401,
-      );
-    }
-
-    // ========================================================
-    // VERIFY DEVICE SECRET
-    // ========================================================
-
-    const {
-      data: secretMatch,
-      error: verifyError,
-    } = await supabase.rpc(
-      "verify_device_secret",
-      {
-        target_secret: deviceSecret,
-        target_hash: credential.secret_hash,
-      },
-    );
-
-    if (verifyError) {
-      logDatabaseFailure("secret_verification", diagnosticId, verifyError.code);
-
-      return jsonResponse(
-        {
-          error:
-            "Authentication service error",
-          diagnostic_id: diagnosticId,
-        },
-        500,
-      );
-    }
-
-    if (!secretMatch) {
-      console.warn(JSON.stringify({
-        event: "device_credential_rejected",
-        diagnostic_id: diagnosticId,
-        reason: "secret_mismatch",
-      }));
-      return jsonResponse(
-        {
-          error:
-            "Invalid device credentials",
         },
         401,
       );
@@ -520,308 +446,42 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ========================================================
-    // CHECK DEVICE
-    // ========================================================
-
-    const {
-      data: device,
-      error: deviceError,
-    } = await supabase
-      .from("devices")
-      .select(`
-        id,
-        hospital_id,
-        assigned_patient_id,
-        status
-      `)
-      .eq("id", deviceId)
-      .maybeSingle();
-
-    if (deviceError) {
-      logDatabaseFailure("device_lookup", diagnosticId, deviceError.code);
-
-      return jsonResponse(
-        {
-          error: "Device lookup failed",
-          diagnostic_id: diagnosticId,
-        },
-        500,
-      );
-    }
-
-    if (!device) {
-      return jsonResponse(
-        {
-          error: "Device not found",
-        },
-        404,
-      );
-    }
-
-    if (
-      device.status === "inactive" ||
-      device.status === "maintenance"
-    ) {
-      return jsonResponse(
-        {
-          error:
-            "Device is not active",
-        },
-        403,
-      );
-    }
-
-    // ========================================================
-    // CHECK DEVICE PATIENT ASSIGNMENT
-    // ========================================================
-
-    const assignedPatientId = device.assigned_patient_id;
-
-    if (!Number.isInteger(assignedPatientId) || assignedPatientId <= 0) {
-      return jsonResponse(
-        {
-          error: "Device has no active patient assignment",
-        },
-        409,
-      );
-    }
-
-    // ========================================================
-    // CHECK PATIENT
-    // ========================================================
-
-    const {
-      data: patient,
-      error: patientError,
-    } = await supabase
-      .from("patients")
-      .select(`
-        id,
-        hospital_id,
-        status
-      `)
-      .eq("id", assignedPatientId)
-      .maybeSingle();
-
-    if (patientError) {
-      logDatabaseFailure("patient_lookup", diagnosticId, patientError.code);
-
-      return jsonResponse(
-        {
-          error:
-            "Patient lookup failed",
-        },
-        500,
-      );
-    }
-
-    if (!patient) {
-      return jsonResponse(
-        {
-          error: "Patient not found",
-        },
-        404,
-      );
-    }
-
-    if (
-      device.hospital_id !== patient.hospital_id
-    ) {
-      return jsonResponse(
-        {
-          error:
-            "Device and patient belong to different hospitals",
-        },
-        403,
-      );
-    }
-
-    // ========================================================
-    // RECORD VITAL
-    // ========================================================
-
-    const {
-      data: readingId,
-      error: readingError,
-    } = await supabase.rpc(
-      "record_vital_reading",
-      {
-        p_patient_id:
-          assignedPatientId,
-
-        p_device_id:
-          body.device_id,
-
-        p_recorded_at:
-          body.recorded_at ??
-          new Date().toISOString(),
-
-        p_heart_rate:
-          body.heart_rate ?? null,
-
-        p_spo2:
-          body.spo2 ?? null,
-
-        p_temperature:
-          body.temperature ?? null,
-
-        p_respiratory_rate:
-          body.respiratory_rate ?? null,
-
-        p_systolic_bp:
-          body.systolic_bp ?? null,
-
-        p_diastolic_bp:
-          body.diastolic_bp ?? null,
-
-        p_blood_glucose:
-          body.blood_glucose ?? null,
-
-        p_weight_kg:
-          body.weight_kg ?? null,
-
-        p_ecg_value:
-          body.ecg_value ?? null,
-
-        p_motion_x:
-          body.motion_x ?? null,
-
-        p_motion_y:
-          body.motion_y ?? null,
-
-        p_motion_z:
-          body.motion_z ?? null,
-
-        p_source:
-          "iot",
-      },
+    // One server-authorized transaction verifies the credential, resolves
+    // the current assignment, writes the vital row/metadata/ECG batch, and
+    // updates device activity. The database trigger broadcasts the committed
+    // batch to the user's scoped private Realtime channel.
+    const { data: ingestResult, error: ingestError } = await supabase.rpc(
+      "ingest_device_vitals",
+      { p_device_id: deviceId, p_device_secret: deviceSecret, p_payload: body },
     );
-
-    if (readingError) {
-      logDatabaseFailure("record_vital_reading", diagnosticId, readingError.code);
-
-      return jsonResponse(
-        {
-          error: "Failed to record vital reading",
-          diagnostic_id: diagnosticId,
-        },
-        500,
-      );
+    if (ingestError) {
+      logDatabaseFailure("transactional_ingest", diagnosticId, ingestError);
+      return jsonResponse({ error: "Failed to record device reading", diagnostic_id: diagnosticId }, 500);
     }
-
-    // These optional fields are written only when firmware actually supplies
-    // them; the existing vital-reading RPC remains the source of clinical rows.
-    if (body.red_raw != null || body.ir_raw != null || body.signal_quality != null ||
-        body.signal_valid != null || body.configuration_version != null || body.ingestion_id != null ||
-        body.object_temperature_c !== undefined || body.pulse_rate_estimate_bpm !== undefined ||
-        body.distance_mm !== undefined || body.ecg_lead_off_positive !== undefined ||
-        body.ecg_lead_off_negative !== undefined || body.sensor_status !== undefined ||
-        body.sensor_errors !== undefined) {
-      const metadataUpdate: Record<string, unknown> = {
-        red_raw: body.red_raw ?? null,
-        ir_raw: body.ir_raw ?? null,
-        signal_quality: body.signal_quality ?? null,
-        signal_valid: body.signal_valid ?? null,
-        configuration_version: body.configuration_version ?? null,
-        ingestion_id: body.ingestion_id ?? null,
+    if (ingestResult?.error) {
+      const status = Number(ingestResult.status) || 500;
+      const messages: Record<string, string> = {
+        invalid_request: "Invalid device request",
+        device_id_mismatch: "Device ID mismatch",
+        invalid_device_credentials: "Invalid device credentials",
+        device_not_found: "Device not found",
+        device_not_active: "Device is not active",
+        device_unassigned: "Device has no active patient assignment",
+        patient_not_found: "Patient not found",
+        device_patient_hospital_mismatch: "Device and patient belong to different hospitals",
       };
-      // Keep legacy device payloads operational until the additive telemetry
-      // migration is applied; new fields are written when the firmware sends them.
-      if (body.object_temperature_c !== undefined) metadataUpdate.object_temperature_c = body.object_temperature_c;
-      if (body.pulse_rate_estimate_bpm !== undefined) metadataUpdate.pulse_rate_estimate_bpm = body.pulse_rate_estimate_bpm;
-      if (body.distance_mm !== undefined) metadataUpdate.distance_mm = body.distance_mm;
-      if (body.ecg_lead_off_positive !== undefined) metadataUpdate.ecg_lead_off_positive = body.ecg_lead_off_positive;
-      if (body.ecg_lead_off_negative !== undefined) metadataUpdate.ecg_lead_off_negative = body.ecg_lead_off_negative;
-      if (body.sensor_status !== undefined) metadataUpdate.sensor_status = body.sensor_status;
-      if (body.sensor_errors !== undefined) metadataUpdate.sensor_errors = body.sensor_errors;
-      const { error: metadataError } = await supabase.from("vital_readings").update(metadataUpdate)
-        .eq("id", readingId).eq("device_id", deviceId);
-      if (metadataError) {
-        logDatabaseFailure("reading_metadata_update", diagnosticId, metadataError.code);
-        return jsonResponse({ error: "Failed to record sensor metadata", diagnostic_id: diagnosticId }, 500);
-      }
+      return jsonResponse({ error: messages[ingestResult.error] || "Device ingest was rejected" }, status);
     }
-
-    if (hasEcgBatch) {
-      const { error: ecgBatchError } = await supabase.from("device_ecg_batches").upsert({
-        batch_id: body.ecg_batch_id,
-        device_id: deviceId,
-        // Patient identity is resolved from the registered device above; the
-        // device cannot choose a patient in its request body.
-        patient_id: assignedPatientId,
-        batch_started_at: body.ecg_batch_started_at ?? new Date(Date.now() - 1000).toISOString(),
-        sample_rate_hz: body.ecg_sample_rate_hz,
-        samples: body.ecg_samples,
-        lead_off_positive: body.ecg_lead_off_positive,
-        lead_off_negative: body.ecg_lead_off_negative,
-        signal_saturated: body.ecg_samples!.some((sample) => sample === 0 || sample === 4095),
-      }, { onConflict: "device_id,batch_id", ignoreDuplicates: true });
-      if (ecgBatchError) {
-        logDatabaseFailure("ecg_batch_insert", diagnosticId, ecgBatchError.code);
-        return jsonResponse({ error: "Failed to record raw ECG batch", diagnostic_id: diagnosticId }, 500);
-      }
-    }
-
-    // Record server-side communication time only after the reading was stored.
-    const ingestionTimestamp = new Date().toISOString();
-    const { data: deviceActivity, error: deviceActivityError } = await supabase
-      .from("devices")
-      .update({ last_seen_at: ingestionTimestamp, status: "online" })
-      .eq("id", deviceId)
-      .in("status", ["offline", "online"])
-      .select("id")
-      .maybeSingle();
-
-    if (deviceActivityError) {
-      // The reading is already stored; keep the successful ingest response while
-      // reporting that the independent activity timestamp could not be updated.
-      logDatabaseFailure("device_activity_update", diagnosticId, deviceActivityError.code);
-    }
-
-    // ========================================================
-    // UPDATE LAST USED
-    // ========================================================
-
-    await supabase
-      .from("device_credentials")
-      .update({
-        last_used_at:
-          new Date().toISOString(),
-      })
-      .eq(
-        "id",
-        credential.id,
-      );
-
-    // ========================================================
-    // SUCCESS
-    // ========================================================
 
     return jsonResponse({
       success: true,
-
-      message:
-        "Vital reading recorded successfully",
-
-      reading_id:
-        readingId,
-
-      device_id:
-        deviceId,
-
-      patient_id:
-        assignedPatientId,
-
-      last_seen_at_updated:
-        Boolean(deviceActivity) && !deviceActivityError,
-
-      ingested_at:
-        ingestionTimestamp,
-
-      recorded_at:
-        body.recorded_at ??
-        new Date().toISOString(),
+      message: "Vital reading recorded successfully",
+      reading_id: ingestResult.reading_id,
+      device_id: deviceId,
+      patient_id: ingestResult.patient_id,
+      last_seen_at_updated: true,
+      ingested_at: new Date().toISOString(),
+      recorded_at: ingestResult.recorded_at,
     });
 
   } catch (error) {

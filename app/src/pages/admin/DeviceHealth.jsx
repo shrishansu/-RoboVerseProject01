@@ -6,6 +6,8 @@ import EcgMonitor from "../../components/EcgMonitor";
 const INVENTORY_REFRESH_MS = 30_000;
 const HISTORY_REFRESH_MS = 30_000;
 const LIVE_REFRESH_MS = 1_000;
+const HISTORY_WINDOW_MS = 10 * 60 * 1_000;
+const LIVE_WINDOW_MS = 10_000;
 const CONFIG_MODULE_KEYS = ["MAX30102", "AD8232", "MPU6050", "VL53L0X"];
 const MODULE_LABELS = {
   MAX30102: { title: "Heart-rate optical reader", description: "Shows raw RED/IR samples and an experimental pulse-rate estimate. This firmware does not calculate SpO₂." },
@@ -73,13 +75,10 @@ export default function DeviceHealth() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState("");
   const [detailError, setDetailError] = useState("");
-  const [lastRefresh, setLastRefresh] = useState(null);
-  const [readingRefresh, setReadingRefresh] = useState(0);
   const [configuration, setConfiguration] = useState(DEFAULT_CONFIG);
   const [configVersion, setConfigVersion] = useState(0);
   const [configSaving, setConfigSaving] = useState(false);
   const [configMessage, setConfigMessage] = useState("");
-  const [periodHours, setPeriodHours] = useState(24);
   const initialLoadStartedForRef = useRef(null);
 
   const loadDevices = useCallback(async (initial = false) => {
@@ -90,7 +89,6 @@ export default function DeviceHealth() {
       if (rpcError) throw rpcError;
       if (!Array.isArray(data?.devices)) throw new Error("Device inventory returned an unexpected response.");
       setDevices(data.devices);
-      setLastRefresh(new Date());
     } catch (loadError) {
       setError(loadError?.message || "Registered devices could not be loaded.");
     } finally {
@@ -121,7 +119,7 @@ export default function DeviceHealth() {
       try {
         const { data, error: rpcError } = await supabase.rpc("get_device_health_data", {
           p_device_id: Number(selectedId),
-          p_from: new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString(),
+          p_from: new Date(Date.now() - HISTORY_WINDOW_MS).toISOString(),
           p_to: new Date().toISOString(),
         });
         if (rpcError) throw rpcError;
@@ -142,7 +140,7 @@ export default function DeviceHealth() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [selectedId, readingRefresh, periodHours]);
+  }, [selectedId]);
 
   useEffect(() => {
     if (!selectedId) return undefined;
@@ -153,7 +151,7 @@ export default function DeviceHealth() {
       requestInFlight = true;
       try {
         const to = new Date();
-        const from = new Date(to.getTime() - 60_000);
+        const from = new Date(to.getTime() - LIVE_WINDOW_MS);
         const { data, error: rpcError } = await supabase.rpc("get_device_health_data", {
           p_device_id: Number(selectedId),
           p_from: from.toISOString(),
@@ -181,37 +179,79 @@ export default function DeviceHealth() {
     let current = true;
     let inFlight = false;
     let since = null;
+    let timer = null;
+    let realtimeConnected = false;
+    const setReconciliationRate = (milliseconds) => {
+      if (timer) window.clearInterval(timer);
+      timer = window.setInterval(fetchBatches, milliseconds);
+    };
+    const mergeBatches = (incoming) => {
+      if (!incoming.length) return;
+      const newest = incoming.reduce((latest, batch) => !latest || new Date(batch.recorded_at) > new Date(latest.recorded_at) ? batch : latest, null);
+      if (newest && (!since || new Date(newest.recorded_at) > new Date(since))) since = newest.recorded_at;
+      setEcgBatches((existing) => {
+        const byId = new Map(existing.map((batch) => [batch.batch_id, batch]));
+        incoming.forEach((batch) => byId.set(batch.batch_id, batch));
+        return [...byId.values()].sort((a, b) => new Date(a.batch_started_at) - new Date(b.batch_started_at)).slice(-30);
+      });
+    };
     const fetchBatches = async () => {
       if (inFlight) return;
       inFlight = true;
       try {
         const { data, error: batchError } = await supabase.rpc("get_device_ecg_batches", {
           p_device_id: Number(selectedId),
-          p_seconds: 10,
+          p_seconds: 30,
           p_since: since,
         });
         if (batchError) throw batchError;
-        if (current) setEcgFeedError(false);
         const incoming = Array.isArray(data?.batches) ? data.batches : [];
-        if (!current || !incoming.length) return;
-        const newest = incoming.reduce((latest, batch) => !latest || new Date(batch.recorded_at) > new Date(latest.recorded_at) ? batch : latest, null);
-        if (newest) since = newest.recorded_at;
-        setEcgBatches((existing) => {
-          const byId = new Map(existing.map((batch) => [batch.batch_id, batch]));
-          incoming.forEach((batch) => byId.set(batch.batch_id, batch));
-          return [...byId.values()].sort((a, b) => new Date(a.recorded_at) - new Date(b.recorded_at)).slice(-12);
-        });
+        if (current) {
+          mergeBatches(incoming);
+          if (!realtimeConnected) setEcgFeedError(false);
+        }
       } catch {
-        if (current) setEcgFeedError(true);
-        // Failed polling leaves prior batches visible; the monitor marks them
-        // unusable once their server recorded_at timestamp is over three seconds old.
+        if (current) {
+          setEcgFeedError(true);
+          setReconciliationRate(1_000);
+        }
       } finally {
         inFlight = false;
       }
     };
+    const channel = supabase
+      .channel(`device-ecg:${selectedId}`, { config: { private: true } })
+      .on("broadcast", { event: "ecg_batch" }, (message) => {
+        if (!current) return;
+        const batch = message?.payload?.batch;
+        if (!batch || Number(batch.device_id) !== Number(selectedId)) return;
+        setEcgFeedError(false);
+        mergeBatches([batch]);
+      })
+      .subscribe((status) => {
+        if (!current) return;
+        if (status === "SUBSCRIBED") {
+          realtimeConnected = true;
+          setEcgFeedError(false);
+          // Reconcile after joining so batches committed during the initial
+          // fetch / WebSocket handshake are not missed.
+          fetchBatches();
+          // Continue a one-second reconciliation even after joining Realtime,
+          // so silently missed broadcasts are recovered promptly.
+          setReconciliationRate(1_000);
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          realtimeConnected = false;
+          setEcgFeedError(true);
+          setReconciliationRate(1_000);
+        }
+      });
     fetchBatches();
-    const timer = window.setInterval(fetchBatches, LIVE_REFRESH_MS);
-    return () => { current = false; window.clearInterval(timer); };
+    setReconciliationRate(1_000);
+    return () => {
+      current = false;
+      if (timer) window.clearInterval(timer);
+      supabase.removeChannel(channel);
+    };
   }, [selectedId]);
 
   useEffect(() => {
@@ -337,7 +377,7 @@ export default function DeviceHealth() {
           {!device.has_patient_assignment ? <div className="clinical-empty">This device has no assigned patient. Assign it from Devices before uploading patient readings: device-ingest rejects unassigned devices, and this page only shows readings linked to the current assignment.</div> : !latest ? <div className="clinical-empty">No readings have been received for this device and its current patient in the selected time range. Check device connection, credential, ingest response, and whether the migrations and Edge Function are deployed.</div> : (
             <dl className="device-health-vitals">
               <div><dt>Recorded at</dt><dd>{formatDate(latest.recorded_at)}</dd></div>
-              <div><dt>Pulse-rate estimate (prototype)</dt><dd>{display(latest.pulse_rate_estimate_bpm, " bpm")}</dd></div>
+              <div><dt>Pulse-rate estimate (prototype)</dt><dd>{latest.pulse_rate_estimate_bpm == null ? "Waiting for a stable optical pulse" : display(latest.pulse_rate_estimate_bpm, " bpm")}</dd></div>
               <div><dt>Raw RED (window average)</dt><dd>{display(latest.red_raw)}</dd></div>
               <div><dt>Raw IR (window average)</dt><dd>{display(latest.ir_raw)}</dd></div>
               <div><dt>Distance</dt><dd>{display(latest.distance_mm, " mm")}</dd></div>
@@ -350,20 +390,8 @@ export default function DeviceHealth() {
 
         {device.has_patient_assignment && <>
           {latest && <section className="panel-card device-health-panel"><h3>Sensor status</h3><ul className="device-health-diagnostics">{visibleSensorEntries(latest.sensor_status).map(([key, status]) => <li key={key}><span>{SENSOR_STATUS_LABELS[key] || key}</span><strong>{status.replaceAll("_", " ")}</strong></li>)}</ul>{visibleSensorEntries(latest.sensor_errors).length > 0 && <div className="clinical-message clinical-error" role="status">{visibleSensorEntries(latest.sensor_errors).map(([key, message]) => <div key={key}>{SENSOR_STATUS_LABELS[key] || key}: {message}</div>)}</div>}</section>}
-          <div className="device-health-details"><ReadingChart readings={readings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate (prototype)" unit="bpm"/><EcgMonitor batches={ecgBatches} feedError={ecgFeedError}/></div>
+          <div className="device-health-details"><ReadingChart readings={readings} field="pulse_rate_estimate_bpm" title="Pulse-rate estimate · last 10 minutes (prototype)" unit="bpm"/><EcgMonitor batches={ecgBatches} feedError={ecgFeedError}/></div>
         </>}
-
-        <section className="panel-card device-health-panel">
-          <div className="device-health-section-heading"><div><h3>Recent readings</h3><p>Newest first · filtered by device ID, current patient assignment, and selected time period</p></div><select aria-label="Reading time period" value={periodHours} onChange={(e) => setPeriodHours(Number(e.target.value))}><option value={1}>Last hour</option><option value={24}>Last 24 hours</option><option value={168}>Last 7 days</option></select><button type="button" className="secondary-action" onClick={() => {
-            setReadingRefresh((value) => value + 1);
-          }}>Refresh readings</button></div>
-          {!device.has_patient_assignment ? <div className="clinical-empty">No patient is assigned to this device.</div> : readings.length === 0 ? <div className="clinical-empty">No readings are available for this device yet.</div> : (
-            <div className="device-health-table-wrap"><table className="device-health-table"><thead><tr><th>Recorded at</th><th>Pulse estimate</th><th>Raw RED</th><th>Raw IR</th><th>Distance</th><th>Raw ECG ADC</th><th>Lead status</th><th>Movement X / Y / Z (g)</th><th>Sensor status</th></tr></thead>
-              <tbody>{readings.map((reading) => <tr key={reading.id}><td>{formatDate(reading.recorded_at)}</td><td>{display(reading.pulse_rate_estimate_bpm, " bpm")}</td><td>{display(reading.red_raw)}</td><td>{display(reading.ir_raw)}</td><td>{display(reading.distance_mm, " mm")}</td><td>{reading.sensor_status?.ecg_sensor === "ok" ? display(reading.ecg_value) : "Unavailable"}</td><td>{reading.ecg_lead_off_positive == null && reading.ecg_lead_off_negative == null ? "—" : `${reading.ecg_lead_off_positive ? "LO+ off" : "LO+ on"} / ${reading.ecg_lead_off_negative ? "LO− off" : "LO− on"}`}</td><td>{[reading.motion_x, reading.motion_y, reading.motion_z].map((value) => display(value, " g")).join(" / ")}</td><td>{reading.sensor_status ? visibleSensorEntries(reading.sensor_status).map(([, status]) => status).join(", ") || "Unavailable" : "Unavailable"}</td></tr>)}</tbody>
-            </table></div>
-          )}
-          <p className="device-health-footnote">Readings update automatically every 5 seconds. Inventory checked {lastRefresh ? lastRefresh.toLocaleString() : "—"}.</p>
-        </section>
       </>}
     </div>
   );

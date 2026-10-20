@@ -1638,8 +1638,10 @@ export type Database = {
       get_current_user_role: { Args: never; Returns: string }
       get_device_management_data: { Args: never; Returns: Json }
         get_device_health_data: { Args: { p_device_id: number; p_from?: string | null; p_to?: string | null }; Returns: Json }
+      get_device_ecg_batches: { Args: { p_device_id: number; p_seconds?: number; p_since?: string | null }; Returns: Json }
         get_device_measurement_config: { Args: { p_device_id: number }; Returns: Json }
         save_device_measurement_config: { Args: { p_device_id: number; p_config: Json }; Returns: Json }
+      ingest_device_vitals: { Args: { p_device_id: number; p_device_secret: string; p_payload: Json }; Returns: Json }
       get_my_assigned_device_health: { Args: never; Returns: Json }
       get_main_admin_dashboard_stats: { Args: never; Returns: Json }
       get_main_admin_hospital_directory: { Args: never; Returns: Json }
