@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { useAuth } from "../context/AuthContext";
+import roboVerseLogo from "../assets/RoboVerse Neon Patient Monitoring Logo.png";
 import HospitalStaffDirectory from "../components/HospitalStaffDirectory";
 import Devices from "./admin/Devices";
 
@@ -280,7 +281,7 @@ function HospitalAdminDashboard() {
     <div className="hospital-admin-dashboard">
       <header className="hospital-admin-header">
         <div>
-          <div className="clinical-brand">RoboVerse</div>
+          <img className="clinical-brand-logo" src={roboVerseLogo} alt="RoboVerse logo" />
           <p>Hospital administration</p>
         </div>
         <div className="hospital-admin-header-actions">

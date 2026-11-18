@@ -92,21 +92,11 @@ a {
 }
 
 .brand-logo {
-  width: 72px;
-  height: 72px;
+  display: block;
+  width: 104px;
+  height: 104px;
   margin: 0 auto 18px;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  border-radius: 50%;
-
-  background: #16845b;
-  color: #ffffff;
-
-  font-size: 24px;
-  font-weight: 800;
+  object-fit: contain;
 }
 
 .brand h1 {
@@ -314,6 +304,9 @@ a {
 
   font-size: 15px;
   font-weight: 800;
+  object-fit: contain;
+  background: transparent;
+  border-radius: 50%;
 }
 
 .admin-brand h2 {
@@ -1176,10 +1169,12 @@ a {
   border-bottom: 1px solid #e2ebe6;
 }
 
-.clinical-brand {
-  font-size: 20px;
-  font-weight: 750;
-  letter-spacing: -0.3px;
+.clinical-brand-logo {
+  display: block;
+  width: 72px;
+  height: 58px;
+  object-fit: contain;
+  object-position: left center;
 }
 
 .clinical-dashboard-header p {

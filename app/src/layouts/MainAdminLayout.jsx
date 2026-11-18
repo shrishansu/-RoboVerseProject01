@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import roboVerseLogo from "../assets/RoboVerse Neon Patient Monitoring Logo.png";
 
 export default function MainAdminLayout() {
   const { profile, logout } = useAuth();
@@ -83,9 +84,7 @@ export default function MainAdminLayout() {
         {/* BRAND */}
 
         <div className="admin-brand">
-          <div className="admin-logo">
-            RV
-          </div>
+          <img className="admin-logo" src={roboVerseLogo} alt="RoboVerse logo" />
 
           <div>
             <h2>RoboVerse</h2>

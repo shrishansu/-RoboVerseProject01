@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "../context/AuthContext";
 import { supabase } from "../lib/supabaseClient";
+import roboVerseLogo from "../assets/RoboVerse Neon Patient Monitoring Logo.png";
 
 const ROLE_CONFIG = {
   doctor: { title: "Doctor Dashboard", patientHeading: "My assigned patients" },
@@ -374,7 +375,7 @@ export default function ClinicalDashboard({ role }) {
     <div className="clinical-dashboard">
       <header className="clinical-dashboard-header">
         <div>
-          <div className="clinical-brand">RoboVerse</div>
+          <img className="clinical-brand-logo" src={roboVerseLogo} alt="RoboVerse logo" />
           <p>{config.title}</p>
         </div>
         <div className="clinical-header-actions">

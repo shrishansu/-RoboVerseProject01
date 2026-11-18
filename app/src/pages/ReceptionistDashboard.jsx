@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { useAuth } from "../context/AuthContext";
+import roboVerseLogo from "../assets/RoboVerse Neon Patient Monitoring Logo.png";
 
 function formatDate(value) {
   if (!value) return "Not provided";
@@ -172,7 +173,7 @@ function ReceptionistDashboard() {
     <div className="reception-dashboard">
       <header className="reception-header">
         <div>
-          <div className="clinical-brand">RoboVerse</div>
+          <img className="clinical-brand-logo" src={roboVerseLogo} alt="RoboVerse logo" />
           <p>Reception and patient identity</p>
         </div>
         <div className="reception-header-actions">

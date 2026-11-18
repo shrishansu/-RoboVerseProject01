@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import roboVerseLogo from "../assets/RoboVerse Neon Patient Monitoring Logo.png";
 
 function getDashboardPath(role) {
   switch (role) {
@@ -113,7 +114,7 @@ export default function Login() {
       <div className="login-card">
 
         <div className="brand">
-          <div className="brand-logo">RV</div>
+          <img className="brand-logo" src={roboVerseLogo} alt="RoboVerse logo" />
 
           <h1>RoboVerse</h1>
 
