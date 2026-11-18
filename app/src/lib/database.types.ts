@@ -585,6 +585,24 @@ export type Database = {
           },
         ]
       }
+      staff_telegram_contacts: {
+        Row: {
+          telegram_chat_id: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          telegram_chat_id: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          telegram_chat_id?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       departments: {
         Row: {
           created_at: string
@@ -1685,6 +1703,12 @@ export type Database = {
         }
       }
       get_my_medication_worklist: { Args: never; Returns: Json }
+      get_my_telegram_chat_id: { Args: never; Returns: string | null }
+      set_my_telegram_chat_id: { Args: { p_chat_id: string }; Returns: undefined }
+      get_patient_alert_recipients: {
+        Args: { p_patient_id: number }
+        Returns: { full_name: string; role: string; telegram_chat_id: string | null; user_id: string }[]
+      }
       get_patient_hospital_id: {
         Args: { target_patient_id: number }
         Returns: number

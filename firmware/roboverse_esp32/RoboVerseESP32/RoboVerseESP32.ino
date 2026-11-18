@@ -35,6 +35,7 @@
 static constexpr int PIN_SDA = 21, PIN_SCL = 22;
 static constexpr int PIN_ECG = 34, PIN_ECG_LO_PLUS = 25, PIN_ECG_LO_MINUS = 26;
 static constexpr int PIN_BUZZER = 27;
+#define PATIENT_BUTTON_PIN 32
 // Fast ECG packets stream independently; clinical/vital summary uploads stay slow.
 static constexpr uint32_t UPLOAD_MS = 5000, WIFI_RETRY_MS = 10000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
@@ -612,6 +613,94 @@ void uploadReading() {
   http.end();
 }
 
+bool sendPatientCallAlert() {
+  if (!sensorHasCert()) {
+    Serial.println("[PATIENT CALL] Cannot send: HTTPS root CA is not configured.");
+    return false;
+  }
+  if (!tlsClockReady()) {
+    Serial.println("[PATIENT CALL] Cannot send: waiting for network time.");
+    return false;
+  }
+
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.printf("[PATIENT CALL] Wi-Fi unavailable; reconnect attempt %u/3.\n", static_cast<unsigned int>(attempt + 1));
+      WiFi.reconnect();
+      delay(1000);
+      continue;
+    }
+
+    const String alertUrl = String(SUPABASE_PROJECT_URL) + "/functions/v1/device-alert";
+    const String payload = "{\"event\":\"patient_call\"}";
+    WiFiClientSecure tls;
+    tls.setCACert(SUPABASE_ROOT_CA);
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    http.setReuse(false);
+    if (!http.begin(tls, alertUrl)) {
+      Serial.printf("[PATIENT CALL] HTTPS setup failed on attempt %u/3.\n", static_cast<unsigned int>(attempt + 1));
+    } else {
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("apikey", SUPABASE_ANON_KEY);
+      http.addHeader("x-device-id", String(ROBO_VERSE_DEVICE_ID));
+      http.addHeader("x-device-secret", ROBO_VERSE_DEVICE_SECRET);
+      const int status = http.POST(payload);
+      if (status == 200) {
+        http.end();
+        Serial.println("[PATIENT CALL] Alert accepted by server.");
+#if BUZZER_ENABLED
+        buzzerSet(true);
+        delay(80);
+        buzzerSet(false);
+#endif
+        return true;
+      }
+      Serial.printf("[PATIENT CALL] Request failed, HTTP %d, attempt %u/3.\n",
+        status, static_cast<unsigned int>(attempt + 1));
+      http.end();
+    }
+    if (attempt < 2) delay((attempt + 1) * 1000);
+  }
+  Serial.println("[PATIENT CALL] Alert was not accepted; check Wi-Fi and server configuration.");
+  return false;
+}
+
+void monitorPatientButton() {
+  static bool lastRawPressed = false;
+  static bool stablePressed = false;
+  static bool triggeredThisPress = false;
+  static uint32_t rawChangedAt = 0;
+  static uint32_t heldSince = 0;
+  static uint32_t cooldownUntil = 0;
+  const uint32_t now = millis();
+  const bool rawPressed = digitalRead(PATIENT_BUTTON_PIN) == LOW;
+
+  if (rawPressed != lastRawPressed) {
+    lastRawPressed = rawPressed;
+    rawChangedAt = now;
+  }
+  if (now - rawChangedAt >= 50 && stablePressed != rawPressed) {
+    stablePressed = rawPressed;
+    if (stablePressed) {
+      heldSince = now;
+      triggeredThisPress = false;
+    } else {
+      heldSince = 0;
+      triggeredThisPress = false;
+    }
+  }
+  if (!stablePressed || triggeredThisPress || now - heldSince < 300) return;
+
+  triggeredThisPress = true;
+  if (static_cast<int32_t>(now - cooldownUntil) < 0) {
+    Serial.println("[PATIENT CALL] Ignored: 30-second post-send cooldown is active.");
+    return;
+  }
+  if (sendPatientCallAlert()) cooldownUntil = millis() + 30000;
+}
+
 void setup() {
   Serial.begin(115200); delay(100);
   analogReadResolution(12);
@@ -620,6 +709,7 @@ void setup() {
   pinMode(PIN_ECG, INPUT);
   analogSetPinAttenuation(PIN_ECG, ADC_11db);
   pinMode(PIN_ECG_LO_PLUS,INPUT); pinMode(PIN_ECG_LO_MINUS,INPUT);
+  pinMode(PATIENT_BUTTON_PIN, INPUT_PULLUP);
 #if BUZZER_ENABLED
   pinMode(PIN_BUZZER,OUTPUT); buzzerSet(false);
 #else
@@ -643,7 +733,7 @@ void setup() {
   Serial.printf("[DEVICE] Numeric database ID %d. Pulse estimate is educational; no SpO2 is sent.\n",ROBO_VERSE_DEVICE_ID);
 }
 void loop() {
-  maintainWifi(); retryMissingSensors();
+  maintainWifi(); retryMissingSensors(); monitorPatientButton();
   if (millis()-lastUpload>=UPLOAD_MS) { lastUpload=millis(); collectPeriodicSensors(); uploadReading(); }
   delay(1);
 }

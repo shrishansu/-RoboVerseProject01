@@ -14,7 +14,16 @@ device. Do not use it for diagnosis or treatment.
 | AD8232 LO+ | GPIO 25 |
 | AD8232 LO- | GPIO 26 |
 | Optional active-high buzzer signal | GPIO 27 |
+| Patient call button (momentary, normally open) | GPIO 32 to button, other button leg to GND |
 | All module grounds | ESP32 GND |
+
+The patient call button uses `INPUT_PULLUP`: leave it open normally and connect
+GPIO 32 to GND while pressed. Firmware debounces it, requires a 300 ms hold,
+and starts a 30-second cooldown after the server accepts an alert. It sends a
+critical patient-call alert to currently assigned active doctors and nurses
+who registered a Telegram chat ID. The patient call HTTP work runs in the main
+loop; ECG sampling remains in its higher-priority FreeRTOS task. A press can
+pause the lower-priority loop while HTTPS retries run.
 
 Use module supply voltages compatible with the ESP32's 3.3 V I/O. Check each
 breakout board's specifications before connecting power. The buzzer is disabled

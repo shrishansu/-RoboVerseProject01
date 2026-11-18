@@ -435,3 +435,8 @@ entrypoint = "./functions/device-ingest/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/device-config/index.ts"
+
+[functions.device-alert]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/device-alert/index.ts"

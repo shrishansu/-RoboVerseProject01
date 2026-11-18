@@ -106,6 +106,46 @@ export default function ClinicalDashboard({ role }) {
   const [busyMedicationTaskId, setBusyMedicationTaskId] = useState(null);
   const [administrationNotes, setAdministrationNotes] = useState({});
   const [currentTime, setCurrentTime] = useState(null);
+  const [telegramChatId, setTelegramChatId] = useState("");
+  const [telegramLoading, setTelegramLoading] = useState(true);
+  const [telegramSaving, setTelegramSaving] = useState(false);
+  const [telegramError, setTelegramError] = useState("");
+  const [telegramNotice, setTelegramNotice] = useState("");
+
+  const loadTelegramChatId = useCallback(async () => {
+    if (!profileId || !["doctor", "nurse"].includes(role)) return;
+    setTelegramLoading(true);
+    setTelegramError("");
+    const { data, error: queryError } = await supabase.rpc("get_my_telegram_chat_id");
+    if (queryError) {
+      console.error("Telegram contact lookup failed:", queryError.code || "unknown");
+      setTelegramError("Telegram contact settings are unavailable. Confirm the patient-call migration is deployed.");
+    } else {
+      setTelegramChatId(data || "");
+    }
+    setTelegramLoading(false);
+  }, [profileId, role]);
+
+  useEffect(() => {
+    loadTelegramChatId();
+  }, [loadTelegramChatId]);
+
+  const saveTelegramChatId = async (event) => {
+    event.preventDefault();
+    setTelegramSaving(true);
+    setTelegramError("");
+    setTelegramNotice("");
+    const { error: saveError } = await supabase.rpc("set_my_telegram_chat_id", {
+      p_chat_id: telegramChatId.trim(),
+    });
+    if (saveError) {
+      console.error("Telegram contact save failed:", saveError.code || "unknown");
+      setTelegramError("Telegram chat ID could not be saved. Check the ID and try again.");
+    } else {
+      setTelegramNotice("Telegram chat ID saved. Patient call alerts can now reach this account.");
+    }
+    setTelegramSaving(false);
+  };
 
   const loadMedicationWorklist = useCallback(async () => {
     if (!profileId || !config) return;
@@ -503,6 +543,35 @@ export default function ClinicalDashboard({ role }) {
               );
             })}
           </div>
+        )}
+
+        {(["doctor", "nurse"].includes(role)) && (
+          <section className="clinical-telegram-card" aria-labelledby="clinical-telegram-heading">
+            <div>
+              <h2 id="clinical-telegram-heading">Telegram alerts</h2>
+              <p>Register your own Telegram chat ID to receive patient call-button alerts for patients assigned to you.</p>
+            </div>
+            <form onSubmit={saveTelegramChatId}>
+              <label htmlFor="telegram-chat-id">Your Telegram chat ID</label>
+              <input
+                id="telegram-chat-id"
+                inputMode="numeric"
+                autoComplete="off"
+                pattern="-?[0-9]{5,20}"
+                maxLength={21}
+                value={telegramChatId}
+                onChange={(event) => setTelegramChatId(event.target.value)}
+                disabled={telegramLoading || telegramSaving}
+                required
+              />
+              <button type="submit" disabled={telegramLoading || telegramSaving || !telegramChatId.trim()}>
+                {telegramLoading ? "Loading..." : telegramSaving ? "Saving..." : "Save chat ID"}
+              </button>
+            </form>
+            <small>Open the RoboVerse bot in Telegram, press Start, then send any message. Ask your admin for your chat ID, or use the helper script.</small>
+            {telegramError && <div className="clinical-message clinical-error" role="alert">{telegramError}</div>}
+            {telegramNotice && <div className="clinical-message clinical-success" role="status">{telegramNotice}</div>}
+          </section>
         )}
 
         <section className="clinical-medication-workflow" aria-labelledby="clinical-medication-heading">
